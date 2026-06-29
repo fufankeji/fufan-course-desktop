@@ -1,0 +1,48 @@
+id: context-engineering-compression-001
+title: 大模型 Agent 上下文工程进阶 - Context Compression Skill 验证
+audience: intermediate
+mode: learner-practice
+recommended_model: deepseek-v4-flash
+objectives:
+  - 知道 context-compression Skill 用来解决什么问题
+  - 观察 Agent 如何加载课程 Skill 并分析上下文膨胀点
+  - 产出一份可迁移到自己项目的上下文压缩改造清单
+skills:
+  - name: context-compression
+    path: .agents/skills/context-compression/SKILL.md
+    quick_prompt: 请使用 context-compression Skill，分析当前 Agent 项目的上下文膨胀点，并输出压缩策略报告。
+steps:
+  - id: step-1
+    title: 确认 Skill 已加载
+    expected_events:
+      - skill-loaded
+      - context-updated
+  - id: step-2
+    title: 分析示例项目上下文结构
+    expected_events:
+      - file-read
+      - context-updated
+  - id: step-3
+    title: 输出压缩策略报告
+    expected_events:
+      - skill-used
+      - report-generated
+safety:
+  mode: classroom
+  redact_home_dir: true
+  redact_env: true
+  block_destructive_commands: true
+export:
+  markdown_report: true
+  jsonl_events: true
+demo:
+  guide: quick-run.md
+  smoke_test:
+    workspace: .
+    commands:
+      - /skills
+      - 请使用 context-compression Skill，分析当前 Agent 项目的上下文膨胀点，并输出压缩策略报告。
+    expected:
+      - TUI Skills 面板能看到 context-compression
+      - Agent 输出 Context Compression Report
+      - 报告包含 Current Context Map、Main Bloat Points、Recommended Strategy 和 Verification Task

@@ -1,0 +1,16 @@
+backend/data/*.sqlite
+backend/data/*.sqlite-*
+backend/knowledge/generated/
+backend/knowledge/source-registry.json
+backend/runtime/bin/codewhale-tui*
+!backend/runtime/bin/.gitkeep
+backend/runtime-packs/**/.codewhale-home/
+backend/runtime-packs/**/.course-session/
+backend/runtime-packs/**/.codewhale/config.toml
+backend/runtime-packs/**/exports/
+src-tauri/binaries/fufan-node-*
+src-tauri/resources/
+dist/
+target/
+node_modules/
+.DS_Store

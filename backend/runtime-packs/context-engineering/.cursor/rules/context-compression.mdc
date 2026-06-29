@@ -1,0 +1,28 @@
+---
+description: Use the course context-compression workflow when analyzing Agent context bloat, message history, memory, summarization, tool result clearing, or compaction.
+globs:
+  - "**/*"
+alwaysApply: false
+---
+
+# Context Compression Rule
+
+When asked to optimize Agent context, follow this workflow:
+
+1. Identify the Agent entrypoint, message flow, tools, memory, and middleware.
+2. List context growth points: long history, large tool results, repeated retrieval, verbose prompts, duplicated task state.
+3. Classify each item as keep, trim, summarize, clear tool result, mask observation, compact, or write to memory.
+4. Recommend an implementation order that preserves correctness.
+5. Produce a verification task and expected before/after signals.
+
+Use the output format:
+
+```text
+Context Compression Report
+1. Current Context Map
+2. Main Bloat Points
+3. Recommended Strategy
+4. Implementation Checklist
+5. Verification Task
+6. Migration Notes
+```

@@ -1,0 +1,22 @@
+{
+  "id": "context-engineering",
+  "title": "上下文工程 Skill 运行包",
+  "coursePathHint": "上下文工程/Part 2. 大模型 Agent 上下文工程进阶——组合编排实战",
+  "defaultForImportedPages": true,
+  "courseMatchers": ["上下文工程", "Context", "Agent", "RAG", "课件", "notebook", "markdown", "html", "pdf"],
+  "skills": [
+    {
+      "id": "context-compression",
+      "name": "Context Compression",
+      "description": "分析 Agent 项目的上下文膨胀点，并输出压缩策略、改造清单和验证任务。",
+      "quickPrompt": "请使用 context-compression Skill，分析当前 Agent 项目的上下文膨胀点，并输出压缩策略报告。",
+      "autoLoad": true,
+      "lessonMatchers": ["上下文", "Context", "压缩", "RAG", "Agent"],
+      "paths": {
+        "codex": ".agents/skills/context-compression/SKILL.md",
+        "claude": ".claude/skills/context-compression/SKILL.md",
+        "cursor": ".cursor/rules/context-compression.mdc"
+      }
+    }
+  ]
+}

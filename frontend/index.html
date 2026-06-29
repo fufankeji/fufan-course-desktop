@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>赋范空间 · 大模型学习平台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark">赋</div>
+          <div>
+            <h1>赋范空间 · 大模型学习平台</h1>
+            <p id="course-subtitle">正在加载课程知识库...</p>
+          </div>
+        </div>
+        <div class="search-box">
+          <input id="global-search" type="search" placeholder="搜索检索增强、部署上线、能力包、上下文工程..." />
+          <button id="search-clear" type="button" title="清空搜索">清空</button>
+        </div>
+        <div class="model-tools">
+          <button id="model-config-open" class="model-config-open" type="button">模型配置</button>
+          <div id="model-status" class="status-pill">
+            <span class="status-dot"></span>
+            未配置模型
+          </div>
+        </div>
+      </header>
+
+      <aside class="sidebar">
+        <div class="sidebar-card">
+          <span class="eyebrow">课程资产包</span>
+          <strong>大模型与智能体工程实战</strong>
+          <p>视频、知识库、能力包、项目产品的统一学习入口。</p>
+          <button id="import-toggle" class="import-toggle" type="button" aria-expanded="false">导入课件</button>
+        </div>
+        <section id="import-panel" class="import-panel hidden" aria-label="导入课件">
+          <div class="import-panel-head">
+            <label for="import-root">课件根目录</label>
+            <button id="collapse-import" class="collapse-import" type="button" aria-label="收起导入面板">
+              收起
+            </button>
+          </div>
+          <input
+            id="import-root"
+            type="text"
+            value="/Volumes/My Passport/【百度网盘】正课课件/2025夏季班_大模型与Agent智能体开发实战"
+          />
+          <div class="import-actions">
+            <button id="pick-folder" type="button">选择文件夹</button>
+            <button id="scan-course" type="button">扫描</button>
+            <button id="run-import" type="button">导入知识库</button>
+          </div>
+          <div id="import-summary" class="import-summary">选择课件目录后扫描。</div>
+          <div id="import-tree" class="import-tree"></div>
+        </section>
+        <div class="sidebar-heading">
+          <span>课程目录</span>
+          <strong id="page-count">0 页</strong>
+        </div>
+        <nav id="module-list" class="learn-nav" aria-label="课程目录"></nav>
+      </aside>
+
+      <main class="reader">
+        <div class="reader-toolbar">
+          <div>
+            <span class="eyebrow">当前知识页</span>
+            <strong id="reader-context">选择课件</strong>
+          </div>
+          <button id="copy-agent-prompt" type="button">复制给智能体</button>
+        </div>
+        <section id="search-results" class="search-results hidden"></section>
+        <article class="page-view">
+          <div class="page-meta">
+            <span id="page-type">课件</span>
+            <span id="page-difficulty">-</span>
+            <span id="page-duration">-</span>
+          </div>
+          <h2 id="page-title">选择一节课程</h2>
+          <p id="page-summary" class="page-summary"></p>
+          <div id="page-tags" class="tag-row"></div>
+          <section id="skill-panel" class="skill-panel hidden" aria-label="课程能力包"></section>
+          <div class="content-divider">
+            <span>课件正文</span>
+          </div>
+          <div id="page-content" class="markdown-body"></div>
+        </article>
+      </main>
+
+      <aside class="chat-panel">
+        <div class="chat-header">
+          <div>
+            <h2>智能学习助教</h2>
+            <p>答案会引用课程知识页</p>
+          </div>
+          <button id="chat-example" type="button" title="填入示例问题">示例</button>
+        </div>
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea id="chat-input" rows="3" placeholder="例如：我想做企业级 RAG 项目，应该先学什么？"></textarea>
+          <button type="submit">发送问题</button>
+        </form>
+      </aside>
+
+      <nav id="quick-tool-dock" class="quick-tool-dock" aria-label="课节工具">
+        <button type="button" data-quick-tool="ai" aria-label="问 AI" title="问 AI">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M15 4l1.2 3.2L19.5 8.5l-3.3 1.3L15 13l-1.2-3.2-3.3-1.3 3.3-1.3L15 4z" />
+            <path d="M6 13l.8 2.1L9 16l-2.2.9L6 19l-.8-2.1L3 16l2.2-.9L6 13z" />
+            <path d="M19 14l.6 1.5 1.4.5-1.4.5L19 18l-.6-1.5-1.4-.5 1.4-.5L19 14z" />
+          </svg>
+        </button>
+        <button type="button" data-quick-tool="materials" aria-label="参考资料" title="参考资料">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 4h6l4 4v12H8z" />
+            <path d="M14 4v4h4" />
+            <path d="M11 12h4" />
+            <path d="M11 16h5" />
+          </svg>
+        </button>
+        <button type="button" data-quick-tool="faq" aria-label="常见问题" title="常见问题">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 19a7 7 0 1 0-7-7 7 7 0 0 0 7 7z" />
+            <path d="M9.9 9a2.2 2.2 0 0 1 4.2.9c0 1.8-2.1 1.9-2.1 3.6" />
+            <path d="M12 16h.01" />
+          </svg>
+        </button>
+        <button type="button" data-quick-tool="notes" aria-label="我的笔记" title="我的笔记">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 4h12v16H6z" />
+            <path d="M9 8h6" />
+            <path d="M9 12h6" />
+            <path d="M9 16h3" />
+          </svg>
+        </button>
+      </nav>
+
+      <aside id="quick-tool-panel" class="quick-tool-panel hidden" aria-label="课节工具面板">
+        <header class="quick-tool-head">
+          <div>
+            <span class="eyebrow">课节工具</span>
+            <h2 id="quick-tool-title">参考资料</h2>
+          </div>
+          <button id="quick-tool-close" type="button" aria-label="关闭课节工具">关闭</button>
+        </header>
+        <div id="quick-tool-body" class="quick-tool-body"></div>
+      </aside>
+
+      <section id="terminal-overlay" class="terminal-overlay hidden" aria-label="赋范智能体控制台">
+        <div class="terminal-drawer">
+          <header class="terminal-head">
+            <div>
+              <span class="eyebrow">赋范智能体</span>
+              <h2 id="terminal-title">智能体控制台</h2>
+            </div>
+            <div class="terminal-actions">
+              <span id="terminal-status" class="terminal-status">待机</span>
+              <button id="terminal-stop" type="button">停止</button>
+              <button id="terminal-close" type="button" aria-label="关闭控制台">关闭</button>
+            </div>
+          </header>
+          <div id="terminal-feed" class="terminal-feed" aria-live="polite"></div>
+          <details class="terminal-raw">
+            <summary>原始运行日志</summary>
+            <pre id="terminal-output" class="terminal-output" tabindex="0"></pre>
+          </details>
+          <div id="terminal-context" class="terminal-context">选择课件后打开控制台。</div>
+          <form id="terminal-form" class="terminal-form">
+            <textarea id="terminal-input" rows="3" placeholder="向赋范智能体提问，例如：帮我解释这节课的关键步骤"></textarea>
+            <button id="terminal-verify" class="secondary" type="button">运行验证</button>
+            <button id="terminal-send" type="submit">发送</button>
+          </form>
+        </div>
+      </section>
+
+      <section id="model-config-overlay" class="config-overlay hidden" aria-label="模型服务配置">
+        <form id="model-config-form" class="config-modal">
+          <header class="config-head">
+            <div>
+              <span class="eyebrow">在线模型服务</span>
+              <h2>模型配置</h2>
+              <p>保存后立即用于课程问答和新打开的智能体控制台。</p>
+            </div>
+            <button id="model-config-close" type="button" aria-label="关闭模型配置">关闭</button>
+          </header>
+          <div class="config-grid">
+            <label>
+              <span>服务商</span>
+              <input id="config-provider" type="text" value="deepseek" />
+            </label>
+            <label>
+              <span>接口地址</span>
+              <input id="config-base-url" type="url" placeholder="https://api.deepseek.com" />
+            </label>
+            <label>
+              <span>模型名称</span>
+              <input id="config-model" type="text" placeholder="deepseek-v4-flash" />
+            </label>
+            <label>
+              <span>模型密钥</span>
+              <input id="config-api-key" type="password" placeholder="留空则保留当前密钥" autocomplete="off" />
+            </label>
+          </div>
+          <div id="config-status" class="config-status-grid"></div>
+          <footer class="config-actions">
+            <button id="config-test" type="button">测试连接</button>
+            <button id="config-save" type="submit">保存配置</button>
+          </footer>
+        </form>
+      </section>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

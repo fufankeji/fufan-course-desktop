@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "赋范空间大模型学习平台",
+  "version": "0.1.0",
+  "identifier": "cn.fufan.course.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:5178",
+    "frontendDist": "../frontend"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "赋范空间 · 大模型学习平台",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1180,
+        "minHeight": 720,
+        "url": "http://127.0.0.1:5178"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "nsis"],
+    "resources": [
+      "resources/backend",
+      "resources/frontend"
+    ],
+    "externalBin": ["binaries/fufan-node"],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": true,
+        "installerIcon": null,
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

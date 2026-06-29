@@ -1,0 +1,28 @@
+{
+  "name": "fufan-course-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "赋范空间大模型学习平台桌面版：Tauri shell with local course backend.",
+  "scripts": {
+    "dev": "node backend/server/index.js",
+    "test": "node --test backend/tests/*.test.js",
+    "check": "npm test",
+    "runtime:build": "cargo build --manifest-path vendor/codewhale-edu/Cargo.toml --package codewhale-tui --bin codewhale-tui --release",
+    "release:smoke": "node scripts/release-smoke.mjs",
+    "prepare:desktop": "node scripts/desktop-package.mjs all",
+    "prepare:resources": "node scripts/desktop-package.mjs resources",
+    "prepare:sidecars": "node scripts/desktop-package.mjs sidecars",
+    "desktop:doctor": "node scripts/desktop-package.mjs doctor",
+    "desktop:dev": "node scripts/tauri-runner.mjs dev",
+    "desktop:build": "npm run prepare:desktop && node scripts/tauri-runner.mjs build",
+    "desktop:build:mac": "npm run prepare:desktop && node scripts/tauri-runner.mjs build --bundles dmg",
+    "desktop:build:win": "npm run prepare:desktop && node scripts/tauri-runner.mjs build --bundles nsis"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}

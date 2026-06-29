@@ -1,0 +1,47 @@
+id: python-debugging-001
+title: Python 调试入门
+audience: beginner
+mode: teacher-demo
+recommended_model: gpt-5-codex
+objectives:
+  - 理解 Agent 如何阅读代码
+  - 观察测试失败到修复的过程
+  - 学习如何复盘 AI 编程轨迹
+steps:
+  - id: step-1
+    title: 读取项目结构
+    expected_events:
+      - file-read
+      - context-updated
+  - id: step-2
+    title: 运行测试并定位错误
+    expected_events:
+      - shell-started
+      - shell-finished
+  - id: step-3
+    title: 修改代码并复测
+    expected_events:
+      - file-changed
+      - shell-finished
+safety:
+  mode: classroom
+  redact_home_dir: true
+  redact_env: true
+  block_destructive_commands: true
+export:
+  markdown_report: true
+  jsonl_events: true
+demo:
+  guide: docs/education/teaching-mode.md
+  smoke_test:
+    workspace: course/examples/python-debugging
+    commands:
+      - 请读取这个项目结构，并解释下一步要做什么
+      - "! pwd"
+      - "! cargo test --version"
+      - /export
+    expected:
+      - Teaching sidebar displays student-visible events
+      - exports/sessions/<session-id>/session.jsonl is generated
+      - exports/sessions/<session-id>/session-report.md is generated
+      - Home path and secrets are redacted in exported content

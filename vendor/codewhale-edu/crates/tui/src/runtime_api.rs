@@ -1,0 +1,8142 @@
+//! Runtime HTTP/SSE API for local CodeWhale automation.
+
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::fs;
+use std::net::{SocketAddr, UdpSocket};
+use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_stream::stream;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::Html;
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::Utc;
+use codewhale_protocol::runtime::{
+    RUNTIME_API_VERSION, RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION, RuntimeCapabilities,
+    RuntimeEventEnvelope, RuntimeExperimentalCapabilities,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tower_http::cors::{Any, CorsLayer};
+
+use crate::dependencies::ExternalTool;
+
+use crate::automation_manager::{
+    AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,
+    CreateAutomationRequest, SharedAutomationManager, UpdateAutomationRequest, spawn_scheduler,
+};
+use crate::config::{ApiProvider, Config, DEFAULT_TEXT_MODEL, save_provider_connection_for};
+use crate::education::events::{
+    EducationActor, EducationEventType, EducationSeverity, EducationVisibility,
+};
+use crate::education::redaction::redact_text;
+use crate::fleet::ledger::{FleetLedgerState, FleetTaskLedgerStatus};
+use crate::fleet::manager::{FleetManager, FleetStatusSnapshot, FleetWorkerInspection};
+use crate::mcp::McpPool;
+use crate::models::{ContentBlock, Message};
+use crate::provider_readiness::provider_readiness_rows;
+use crate::runtime_threads::{
+    CompactThreadRequest, CreateThreadRequest, ExternalApprovalDecision, RuntimeThreadManager,
+    RuntimeThreadManagerConfig, RuntimeTurnStatus, SharedRuntimeThreadManager, StartTurnRequest,
+    SteerTurnRequest, ThreadDetail, ThreadListFilter, ThreadRecord, TurnItemKind,
+    TurnItemLifecycleStatus, TurnRecord, UpdateThreadRequest, UsageGroupBy,
+};
+use crate::session_manager::{
+    SavedSession, SessionManager, SessionMetadata, create_saved_session_with_id_and_mode,
+    default_sessions_dir,
+};
+use crate::skill_state::SkillStateStore;
+use crate::task_manager::{
+    NewTaskRequest, SharedTaskManager, TaskManager, TaskManagerConfig, TaskRecord, TaskSummary,
+};
+use crate::tools::subagent::{AgentWorkerRecord, load_persisted_agent_worker_records};
+use codewhale_protocol::fleet::{
+    FleetArtifactKind, FleetRun, FleetRunId, FleetWorkerEventPayload, FleetWorkerStatus,
+};
+
+#[derive(Clone)]
+pub struct RuntimeApiState {
+    config: Config,
+    workspace: PathBuf,
+    task_manager: SharedTaskManager,
+    runtime_threads: SharedRuntimeThreadManager,
+    cors_origins: Vec<String>,
+    sessions_dir: PathBuf,
+    mcp_config_path: PathBuf,
+    automations: SharedAutomationManager,
+    runtime_token: Option<String>,
+    skill_state: Arc<Mutex<SkillStateStore>>,
+    auth_required: bool,
+    bind_host: String,
+    bind_port: u16,
+    mobile_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeApiOptions {
+    pub host: String,
+    pub port: u16,
+    pub workers: usize,
+    /// Additional CORS origins to allow on top of the built-in defaults
+    /// (`http://localhost:{3000,1420}`, `http://127.0.0.1:{3000,1420}`,
+    /// `tauri://localhost`). Populated by `--cors-origin` (repeatable),
+    /// `CODEWHALE_CORS_ORIGINS` (comma-separated, `DEEPSEEK_CORS_ORIGINS`
+    /// as alias), and `[runtime_api] cors_origins` in `config.toml`.
+    /// Whalescale#255 / #561.
+    pub cors_origins: Vec<String>,
+    /// Optional bearer token required for `/v1/*` routes. If omitted here,
+    /// `run_http_server` checks `CODEWHALE_RUNTIME_TOKEN`, then
+    /// `DEEPSEEK_RUNTIME_TOKEN` as an alias.
+    pub auth_token: Option<String>,
+    /// Allow `/v1/*` routes without auth when no token is configured.
+    pub insecure_no_auth: bool,
+    /// Enables the built-in mobile control page at `/mobile`.
+    pub mobile: bool,
+    /// Show a QR code for the mobile URL in the terminal.
+    pub show_qr: bool,
+}
+
+impl Default for RuntimeApiOptions {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 7878,
+            workers: 2,
+            cors_origins: Vec::new(),
+            auth_token: None,
+            insecure_no_auth: false,
+            mobile: false,
+            show_qr: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRuntimeAuth {
+    token: Option<String>,
+    generated: bool,
+}
+
+fn resolve_runtime_auth(
+    cli_token: Option<String>,
+    env_token: Option<String>,
+    insecure_no_auth: bool,
+) -> ResolvedRuntimeAuth {
+    if let Some(token) = first_nonblank_token(cli_token).or_else(|| first_nonblank_token(env_token))
+    {
+        return ResolvedRuntimeAuth {
+            token: Some(token),
+            generated: false,
+        };
+    }
+    if insecure_no_auth {
+        return ResolvedRuntimeAuth {
+            token: None,
+            generated: false,
+        };
+    }
+    ResolvedRuntimeAuth {
+        token: Some(generate_runtime_token()),
+        generated: true,
+    }
+}
+
+fn first_nonblank_token(token: Option<String>) -> Option<String> {
+    token
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn generate_runtime_token() -> String {
+    format!(
+        "cwrt_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamTurnRequest {
+    prompt: String,
+    model: Option<String>,
+    mode: Option<String>,
+    workspace: Option<PathBuf>,
+    allow_shell: Option<bool>,
+    trust_mode: Option<bool>,
+    auto_approve: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    service: &'static str,
+    mode: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionsResponse {
+    sessions: Vec<SessionMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDetailResponse {
+    metadata: SessionMetadata,
+    messages: Vec<serde_json::Value>,
+    system_prompt: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    thread_id: String,
+    title: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateSessionResponse {
+    session_id: String,
+    thread_id: String,
+    message_count: usize,
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeSessionRequest {
+    model: Option<String>,
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeSessionResponse {
+    thread_id: String,
+    session_id: String,
+    message_count: usize,
+    summary: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TasksResponse {
+    tasks: Vec<TaskSummary>,
+    counts: crate::task_manager::TaskCounts,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsQuery {
+    limit: Option<usize>,
+    search: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TasksQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadsQuery {
+    limit: Option<usize>,
+    include_archived: Option<bool>,
+    /// When `true`, returns archived threads only (overrides `include_archived`).
+    /// Whalescale#260 / #563.
+    archived_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadSummaryQuery {
+    limit: Option<usize>,
+    search: Option<String>,
+    include_archived: Option<bool>,
+    /// When `true`, returns archived threads only (overrides `include_archived`).
+    /// Whalescale#260 / #563.
+    archived_only: Option<bool>,
+}
+
+fn resolve_thread_filter(
+    include_archived: Option<bool>,
+    archived_only: Option<bool>,
+) -> ThreadListFilter {
+    if archived_only.unwrap_or(false) {
+        ThreadListFilter::ArchivedOnly
+    } else if include_archived.unwrap_or(false) {
+        ThreadListFilter::IncludeArchived
+    } else {
+        ThreadListFilter::ActiveOnly
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ThreadSummary {
+    id: String,
+    title: String,
+    preview: String,
+    model: String,
+    mode: String,
+    workspace: PathBuf,
+    branch: Option<String>,
+    head: Option<String>,
+    dirty: bool,
+    archived: bool,
+    updated_at: chrono::DateTime<Utc>,
+    latest_turn_id: Option<String>,
+    latest_turn_status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceStatusResponse {
+    workspace: PathBuf,
+    git_repo: bool,
+    branch: Option<String>,
+    head: Option<String>,
+    dirty: bool,
+    staged: usize,
+    unstaged: usize,
+    untracked: usize,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFilesQuery {
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceFileContentQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFilesResponse {
+    workspace: PathBuf,
+    path: String,
+    parent: Option<String>,
+    entries: Vec<WorkspaceFileEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFileEntry {
+    name: String,
+    path: String,
+    kind: WorkspaceFileKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_at: Option<chrono::DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_children: Option<bool>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+enum WorkspaceFileKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFileContentResponse {
+    path: String,
+    kind: WorkspaceFilePreviewKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<&'static str>,
+    size: u64,
+    truncated: bool,
+    max_bytes: usize,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsupported_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum WorkspaceFilePreviewKind {
+    Text,
+    Binary,
+    Unreadable,
+}
+
+const WORKSPACE_FILE_PREVIEW_MAX_BYTES: usize = 200 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProvidersResponse {
+    current: CurrentProviderResponse,
+    providers: Vec<ProviderCatalogEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentProviderResponse {
+    provider: &'static str,
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    api_key_configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCatalogEntry {
+    id: &'static str,
+    label: &'static str,
+    supports_base_url: bool,
+    requires_api_key: bool,
+    api_key_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestRequest {
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestResponse {
+    ok: bool,
+    provider: &'static str,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url_host: Option<String>,
+    api_key_configured: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderConnectionRequest {
+    provider: String,
+    model: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    #[serde(default)]
+    persist: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderConnectionResponse {
+    ok: bool,
+    provider: &'static str,
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_url: Option<String>,
+    api_key_configured: bool,
+    persisted: bool,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceGitMetadata {
+    branch: Option<String>,
+    head: Option<String>,
+    dirty: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillEntry {
+    name: String,
+    description: String,
+    path: PathBuf,
+    enabled: bool,
+    is_bundled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillsResponse {
+    directory: PathBuf,
+    directories: Vec<PathBuf>,
+    warnings: Vec<String>,
+    skills: Vec<SkillEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentRunsResponse {
+    runs: Vec<AgentWorkerRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSkillEnabledRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SetSkillEnabledResponse {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideApprovalBody {
+    decision: String,
+    #[serde(default)]
+    remember: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DecideApprovalResponse {
+    ok: bool,
+    approval_id: String,
+    decision: String,
+    delivered: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitUserInputBody {
+    answers: Vec<UserInputAnswerBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserInputAnswerBody {
+    id: String,
+    label: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitUserInputResponse {
+    ok: bool,
+    input_id: String,
+    delivered: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeInfoResponse {
+    service: &'static str,
+    runtime_api_version: &'static str,
+    codewhale_version: &'static str,
+    bind_host: String,
+    port: u16,
+    auth_required: bool,
+    transports: Vec<&'static str>,
+    capabilities: RuntimeCapabilities,
+    experimental: RuntimeExperimentalCapabilities,
+    // Backward-compatible alias kept for existing clients.
+    version: &'static str,
+}
+
+fn default_runtime_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities {
+        threads: true,
+        turns: true,
+        turn_steer: true,
+        turn_interrupt: true,
+        event_replay: true,
+        external_tools: false,
+        environments: false,
+        worker_runtime: false,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct McpServerEntry {
+    name: String,
+    enabled: bool,
+    required: bool,
+    command: Option<String>,
+    url: Option<String>,
+    connected: bool,
+    enabled_tools: Vec<String>,
+    disabled_tools: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpServersResponse {
+    servers: Vec<McpServerEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct McpToolsQuery {
+    server: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpToolEntry {
+    server: String,
+    name: String,
+    prefixed_name: String,
+    description: Option<String>,
+    input_schema: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct McpToolsResponse {
+    tools: Vec<McpToolEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutomationRunsQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreadEventsQuery {
+    since_seq: Option<u64>,
+    replay_limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TeachingEventsQuery {
+    limit: Option<usize>,
+    after_seq: Option<u64>,
+    since: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeachingEventsResponse {
+    thread_id: String,
+    latest_seq: u64,
+    events: Vec<TeachingEventEntry>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeachingEventEntry {
+    seq: u64,
+    id: String,
+    session_id: String,
+    #[serde(rename = "type")]
+    event_type: EducationEventType,
+    timestamp: String,
+    category: &'static str,
+    actor: EducationActor,
+    visibility: EducationVisibility,
+    severity: EducationSeverity,
+    summary: String,
+    data: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct StartTurnResponse {
+    thread: ThreadRecord,
+    turn: TurnRecord,
+}
+
+/// Start the runtime API server.
+pub async fn run_http_server(
+    config: Config,
+    workspace: PathBuf,
+    options: RuntimeApiOptions,
+) -> Result<()> {
+    if options.port == 0 {
+        bail!("Port must be > 0");
+    }
+
+    let task_cfg = TaskManagerConfig::from_runtime(
+        &config,
+        workspace.clone(),
+        config.default_text_model.clone(),
+        Some(options.workers),
+    );
+    let runtime_threads = Arc::new(RuntimeThreadManager::open(
+        config.clone(),
+        workspace.clone(),
+        RuntimeThreadManagerConfig::from_task_data_dir(task_cfg.data_dir.clone()),
+    )?);
+    let task_manager =
+        TaskManager::start_with_runtime_manager(task_cfg, config.clone(), runtime_threads.clone())
+            .await?;
+    let automations = Arc::new(Mutex::new(AutomationManager::default_location()?));
+    runtime_threads.attach_automation_manager(automations.clone());
+    let scheduler_cancel = CancellationToken::new();
+    let scheduler_handle = spawn_scheduler(
+        automations.clone(),
+        task_manager.clone(),
+        scheduler_cancel.clone(),
+        AutomationSchedulerConfig::default(),
+    );
+
+    let sessions_dir = default_sessions_dir().unwrap_or_else(|_| {
+        dirs::home_dir()
+            .map(|h| h.join(".deepseek").join("sessions"))
+            .unwrap_or_else(|| PathBuf::from(".deepseek").join("sessions"))
+    });
+    let runtime_token_env = std::env::var("CODEWHALE_RUNTIME_TOKEN")
+        .ok()
+        .or_else(|| std::env::var("DEEPSEEK_RUNTIME_TOKEN").ok());
+    let resolved_auth = resolve_runtime_auth(
+        options.auth_token.clone(),
+        runtime_token_env,
+        options.insecure_no_auth,
+    );
+    let runtime_token = resolved_auth.token.clone();
+    let auth_enabled = runtime_token.is_some();
+    let skill_state = SkillStateStore::load_default().unwrap_or_else(|err| {
+        tracing::warn!(
+            "Failed to load skills_state.toml ({}); treating all skills as enabled",
+            err
+        );
+        SkillStateStore::default()
+    });
+    let state = RuntimeApiState {
+        config: config.clone(),
+        workspace,
+        task_manager,
+        runtime_threads,
+        cors_origins: options.cors_origins.clone(),
+        sessions_dir,
+        mcp_config_path: config.mcp_config_path(),
+        automations,
+        runtime_token: runtime_token.clone(),
+        skill_state: Arc::new(Mutex::new(skill_state)),
+        auth_required: auth_enabled,
+        bind_host: options.host.clone(),
+        bind_port: options.port,
+        mobile_enabled: options.mobile,
+    };
+    let app = build_router(state);
+
+    let addr: SocketAddr = format!("{}:{}", options.host, options.port)
+        .parse()
+        .with_context(|| format!("Invalid bind address '{}:{}'", options.host, options.port))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind {addr}"))?;
+
+    println!("Runtime API listening on http://{addr}");
+    if resolved_auth.generated {
+        if let Some(token) = runtime_token.as_deref() {
+            println!("Runtime API auth: generated bearer token for this process.");
+            println!("  Authorization: Bearer {token}");
+            println!(
+                "  Set CODEWHALE_RUNTIME_TOKEN (or DEEPSEEK_RUNTIME_TOKEN as an alias) or pass --auth-token for a stable token."
+            );
+        }
+    } else if auth_enabled {
+        println!("Runtime API auth: bearer token required for /v1/* routes.");
+    } else {
+        println!("Runtime API auth: disabled by explicit insecure mode.");
+    }
+    if options.mobile {
+        print_mobile_urls(
+            addr,
+            runtime_token.as_deref(),
+            auth_enabled,
+            options.show_qr,
+        );
+    }
+    let is_loopback = options.host == "127.0.0.1" || options.host == "::1";
+    if is_loopback {
+        println!("Security: this server is local-first. Do not expose it to untrusted networks.");
+    } else {
+        println!(
+            "Security: bound to {host}; reachable from any peer that can route to this address.",
+            host = options.host
+        );
+        if !auth_enabled {
+            println!(
+                "  WARNING: auth is disabled. Anyone on the network can call /v1/* without authentication."
+            );
+        }
+        println!(
+            "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
+            host = options.host,
+            port = options.port,
+            auth = auth_enabled,
+        );
+    }
+    let serve_result = axum::serve(listener, app)
+        .await
+        .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    scheduler_cancel.cancel();
+    scheduler_handle.abort();
+    serve_result
+}
+
+pub fn build_router(state: RuntimeApiState) -> Router {
+    let api_routes = Router::new()
+        .route(
+            "/v1/sessions",
+            get(list_sessions)
+                .post(create_session_from_thread)
+                .put(save_current_session),
+        )
+        .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/v1/sessions/{id}/resume-thread",
+            post(resume_session_thread),
+        )
+        .route("/v1/workspace/files/content", get(workspace_file_content))
+        .route("/v1/workspace/files", get(workspace_files))
+        .route("/v1/workspace/status", get(workspace_status))
+        .route("/v1/providers", get(list_providers))
+        .route("/v1/providers/test", post(test_provider_connection))
+        .route("/v1/providers/connection", post(apply_provider_connection))
+        .route("/v1/agent-runs", get(list_agent_runs))
+        .route("/v1/agent-runs/{run_id}", get(get_agent_run))
+        .route("/v1/fleet/runs", get(list_fleet_runs))
+        .route("/v1/fleet/runs/{run_id}", get(get_fleet_run))
+        .route(
+            "/v1/fleet/runs/{run_id}/workers",
+            get(list_fleet_run_workers),
+        )
+        .route("/v1/fleet/runs/{run_id}/stop", post(stop_fleet_run))
+        .route("/v1/fleet/workers/{worker_id}", get(get_fleet_worker))
+        .route(
+            "/v1/fleet/workers/{worker_id}/interrupt",
+            post(interrupt_fleet_worker),
+        )
+        .route(
+            "/v1/fleet/workers/{worker_id}/restart",
+            post(restart_fleet_worker),
+        )
+        .route("/v1/stream", post(stream_turn))
+        .route("/v1/threads", get(list_threads).post(create_thread))
+        .route("/v1/threads/summary", get(list_threads_summary))
+        .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route("/v1/threads/{id}/resume", post(resume_thread))
+        .route("/v1/threads/{id}/fork", post(fork_thread))
+        .route("/v1/threads/{id}/undo", post(undo_thread_turn))
+        .route("/v1/threads/{id}/patch-undo", post(patch_undo_thread_turn))
+        .route("/v1/threads/{id}/retry", post(retry_thread_turn))
+        .route("/v1/threads/{id}/turns", post(start_thread_turn))
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/steer",
+            post(steer_thread_turn),
+        )
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/interrupt",
+            post(interrupt_thread_turn),
+        )
+        .route("/v1/threads/{id}/compact", post(compact_thread))
+        .route(
+            "/v1/threads/{id}/teaching-events",
+            get(list_teaching_events),
+        )
+        .route(
+            "/v1/threads/{id}/teaching-events/stream",
+            get(stream_teaching_events),
+        )
+        .route("/v1/threads/{id}/events", get(stream_thread_events))
+        .route("/v1/approvals/{approval_id}", post(decide_approval))
+        .route(
+            "/v1/user-input/{thread_id}/{input_id}",
+            post(submit_user_input),
+        )
+        .route("/v1/tasks", get(list_tasks).post(create_task))
+        .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/cancel", post(cancel_task))
+        .route("/v1/skills", get(list_skills))
+        .route("/v1/skills/{name}", post(set_skill_enabled))
+        .route("/v1/apps/mcp/servers", get(list_mcp_servers))
+        .route("/v1/apps/mcp/tools", get(list_mcp_tools))
+        .route(
+            "/v1/automations",
+            get(list_automations).post(create_automation),
+        )
+        .route(
+            "/v1/automations/{id}",
+            get(get_automation)
+                .patch(update_automation)
+                .delete(delete_automation),
+        )
+        .route("/v1/automations/{id}/run", post(run_automation))
+        .route("/v1/automations/{id}/pause", post(pause_automation))
+        .route("/v1/automations/{id}/resume", post(resume_automation))
+        .route("/v1/automations/{id}/runs", get(list_automation_runs))
+        .route("/v1/usage", get(get_usage))
+        .route("/v1/snapshots", get(list_snapshots))
+        .route("/v1/snapshots/{id}/restore", post(restore_snapshot))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_runtime_token,
+        ));
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/mobile", get(mobile_page))
+        .route("/mobile/", get(mobile_page))
+        .route("/v1/runtime/info", get(runtime_info))
+        .merge(api_routes)
+        .layer(cors_layer(&state.cors_origins))
+        .with_state(state)
+}
+
+async fn require_runtime_token(
+    State(state): State<RuntimeApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let Some(expected) = state.runtime_token.as_deref() else {
+        return next.run(req).await;
+    };
+    let authorized = request_has_runtime_token(&req, expected);
+
+    if authorized {
+        next.run(req).await
+    } else {
+        runtime_token_required_response()
+    }
+}
+
+fn request_has_runtime_token(req: &Request, expected: &str) -> bool {
+    req.headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected)
+        || req
+            .headers()
+            .get("x-codewhale-runtime-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| token == expected)
+        || req
+            .headers()
+            .get("x-deepseek-runtime-token")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|token| token == expected)
+        || token_from_query(req.uri().query()).is_some_and(|token| token == expected)
+}
+
+fn runtime_token_required_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "message": "runtime API bearer token required",
+                "status": StatusCode::UNAUTHORIZED.as_u16(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn token_from_query(query: Option<&str>) -> Option<String> {
+    query.and_then(|query| {
+        query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == "token")
+                .then(|| percent_decode_query_component(value))
+                .flatten()
+        })
+    })
+}
+
+fn percent_decode_query_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hi = *bytes.get(index + 1)?;
+                let lo = *bytes.get(index + 2)?;
+                let hi = (hi as char).to_digit(16)? as u8;
+                let lo = (lo as char).to_digit(16)? as u8;
+                decoded.push((hi << 4) | lo);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Response {
+    if !state.mobile_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            "mobile control is disabled; start with `codewhale serve --mobile`",
+        )
+            .into_response();
+    }
+    if let Some(expected) = state.runtime_token.as_deref()
+        && !request_has_runtime_token(&req, expected)
+    {
+        return runtime_token_required_response();
+    }
+    Html(MOBILE_HTML).into_response()
+}
+
+fn print_mobile_urls(addr: SocketAddr, token: Option<&str>, auth_enabled: bool, show_qr: bool) {
+    println!("Mobile control page enabled.");
+    let token_query = if auth_enabled {
+        token
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| format!("?token={}", url_query_component(token)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let port = addr.port();
+    let qr_url = if addr.ip().is_unspecified() {
+        println!("  Local: http://127.0.0.1:{port}/mobile{token_query}");
+        if let Some(ip) = detect_lan_ip() {
+            let lan_url = format!("http://{ip}:{port}/mobile{token_query}");
+            println!("  LAN:   {lan_url}");
+            lan_url
+        } else {
+            println!(
+                "  LAN:   bind is 0.0.0.0; open http://<this-machine-ip>:{port}/mobile{token_query}"
+            );
+            format!("http://127.0.0.1:{port}/mobile{token_query}")
+        }
+    } else {
+        let url = format!("http://{addr}/mobile{token_query}");
+        println!("  URL:   {url}");
+        url
+    };
+    println!("Mobile security: use only on a trusted LAN/VPN; this server does not provide TLS.");
+
+    if show_qr {
+        match qrcode::QrCode::new(qr_url.as_bytes()) {
+            Ok(qr) => {
+                let qr_str = qr.render::<qrcode::render::unicode::Dense1x2>().build();
+                println!("\n{qr_str}");
+            }
+            Err(e) => {
+                eprintln!("Warning: could not generate QR code: {e}");
+            }
+        }
+    }
+}
+
+fn url_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn detect_lan_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // UDP connect only selects the outbound interface locally; no packet is sent.
+    socket.connect("10.255.255.255:1").ok()?;
+    let addr = socket.local_addr().ok()?;
+    Some(addr.ip().to_string())
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        service: "codewhale-runtime-api",
+        mode: "local",
+    })
+}
+
+async fn list_sessions(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<SessionsResponse>, ApiError> {
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let mut sessions = if let Some(search) = query.search {
+        manager
+            .search_sessions(&search)
+            .map_err(|e| ApiError::internal(format!("Failed to search sessions: {e}")))?
+    } else {
+        manager
+            .list_sessions()
+            .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    sessions.truncate(limit);
+    Ok(Json(SessionsResponse { sessions }))
+}
+
+async fn get_session(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionDetailResponse>, ApiError> {
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let session = manager
+        .load_session(&id)
+        .map_err(|e| map_session_err(&id, e, "read"))?;
+    Ok(Json(session_to_detail(session)))
+}
+
+async fn resume_session_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<ResumeSessionRequest>,
+) -> Result<(StatusCode, Json<ResumeSessionResponse>), ApiError> {
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let session = manager
+        .load_session(&id)
+        .map_err(|e| map_session_err(&id, e, "read"))?;
+
+    let model = req.model.unwrap_or_else(|| session.metadata.model.clone());
+    let mode = req.mode.unwrap_or_else(|| {
+        session
+            .metadata
+            .mode
+            .clone()
+            .unwrap_or_else(|| "agent".to_string())
+    });
+
+    let thread = state
+        .runtime_threads
+        .create_thread(CreateThreadRequest {
+            model: Some(model),
+            workspace: Some(state.workspace.clone()),
+            mode: Some(mode),
+            allow_shell: None,
+            trust_mode: None,
+            auto_approve: None,
+            archived: false,
+            system_prompt: session.system_prompt.clone(),
+            task_id: None,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to create thread: {e}")))?;
+
+    let msg_count = session.messages.len();
+    state
+        .runtime_threads
+        .seed_thread_from_messages(&thread.id, &session.messages)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to seed thread history: {e}")))?;
+
+    let summary = format!(
+        "Resumed session '{}' ({} messages) into thread {}",
+        session.metadata.title, msg_count, thread.id
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(ResumeSessionResponse {
+            thread_id: thread.id,
+            session_id: id,
+            message_count: msg_count,
+            summary,
+        }),
+    ))
+}
+
+async fn create_session_from_thread(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<CreateSessionResponse>), ApiError> {
+    let thread_id = req.thread_id.trim();
+    if thread_id.is_empty() {
+        return Err(ApiError::bad_request("thread_id is required"));
+    }
+
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(thread_id)
+        .await
+        .map_err(map_thread_err)?;
+
+    if thread_detail_has_live_work(&detail) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: format!(
+                "Thread {thread_id} has a queued or active turn; wait for completion before saving as a session"
+            ),
+        });
+    }
+
+    let messages = messages_from_thread_detail(&detail);
+    if messages.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Thread {thread_id} has no user or assistant messages to save"
+        )));
+    }
+
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    let total_tokens = total_tokens_from_thread_detail(&detail);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut session = create_saved_session_with_id_and_mode(
+        session_id.clone(),
+        &messages,
+        &detail.thread.model,
+        &detail.thread.workspace,
+        total_tokens,
+        None,
+        Some(&detail.thread.mode),
+    );
+    session.system_prompt = detail.thread.system_prompt.clone();
+
+    if let Some(title) =
+        session_title_override(req.title.as_deref(), detail.thread.title.as_deref())
+    {
+        session.metadata.title = title;
+    }
+    let title = session.metadata.title.clone();
+    let message_count = session.metadata.message_count;
+
+    manager
+        .save_session(&session)
+        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateSessionResponse {
+            session_id,
+            thread_id: detail.thread.id,
+            message_count,
+            title,
+        }),
+    ))
+}
+
+fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
+    detail.turns.iter().any(|turn| {
+        matches!(
+            turn.status,
+            RuntimeTurnStatus::Queued | RuntimeTurnStatus::InProgress
+        )
+    }) || detail.items.iter().any(|item| {
+        matches!(
+            item.status,
+            TurnItemLifecycleStatus::Queued | TurnItemLifecycleStatus::InProgress
+        )
+    })
+}
+
+fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
+    let items_by_id: HashMap<&str, _> = detail
+        .items
+        .iter()
+        .map(|item| (item.id.as_str(), item))
+        .collect();
+    let mut messages = Vec::new();
+
+    for turn in &detail.turns {
+        for item_id in &turn.item_ids {
+            let Some(item) = items_by_id.get(item_id.as_str()) else {
+                continue;
+            };
+            let role = match item.kind {
+                TurnItemKind::UserMessage => "user",
+                TurnItemKind::AgentMessage => "assistant",
+                _ => continue,
+            };
+            let Some(text) = item.detail.as_deref().map(str::trim) else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            messages.push(Message {
+                role: role.to_string(),
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                    cache_control: None,
+                }],
+            });
+        }
+    }
+
+    messages
+}
+
+// ── Session save (engine-snapshot path) ────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct SaveSessionRequest {
+    /// Thread ID to save as a session. If omitted, saves the most recently
+    /// active thread.
+    #[serde(default)]
+    thread_id: Option<String>,
+    /// If provided, update the existing session with this ID instead of
+    /// creating a new one. This matches TUI's `build_session_snapshot`
+    /// behavior where it updates the current session in-place.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SaveSessionResponse {
+    session_id: String,
+    session: SessionDetailResponse,
+}
+
+/// `PUT /v1/sessions` — save a thread's current engine state as a session.
+///
+/// Unlike `POST /v1/sessions` (which reconstructs messages from stored turn
+/// items), this endpoint asks the engine for its live session snapshot so
+/// token counts and message ordering are authoritative.
+async fn save_current_session(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<SaveSessionRequest>,
+) -> Result<Json<SaveSessionResponse>, ApiError> {
+    // Find the thread to save.
+    let thread_id = match req.thread_id {
+        Some(id) => id,
+        None => {
+            // Find the most recently updated thread.
+            let threads = state
+                .runtime_threads
+                .list_threads(ThreadListFilter::IncludeArchived, Some(100))
+                .await
+                .map_err(map_thread_err)?;
+            threads
+                .into_iter()
+                .max_by_key(|t| t.updated_at)
+                .map(|t| t.id)
+                .ok_or_else(|| ApiError::bad_request("No threads to save"))?
+        }
+    };
+
+    // Get the engine handle (loads the thread into an engine if needed),
+    // then request a session snapshot. This reuses the same code path as
+    // TUI's `build_session_snapshot`: the engine holds the authoritative
+    // messages and token usage, so we don't need to reconstruct from turns.
+    let engine = state
+        .runtime_threads
+        .get_engine(&thread_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to get engine for thread: {e}")))?;
+
+    let snapshot = engine
+        .get_session_snapshot()
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to get session snapshot: {e}")))?;
+
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+
+    // Build or update the session, mirroring TUI's `build_session_snapshot`.
+    // Only `io::ErrorKind::NotFound` falls back to creating a new session;
+    // other I/O errors (e.g. PermissionDenied) are propagated so callers
+    // don't silently overwrite a corrupt or inaccessible session file.
+    let session = if let Some(ref existing_id) = req.session_id {
+        match manager.load_session(existing_id) {
+            Ok(existing) => {
+                let mut updated = crate::session_manager::update_session(
+                    existing,
+                    &snapshot.messages,
+                    snapshot.total_tokens,
+                    snapshot.system_prompt.as_ref(),
+                );
+                updated.metadata.model = snapshot.model.clone();
+                updated.metadata.mode = Some(snapshot.mode.clone());
+                updated
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    crate::session_manager::create_saved_session_with_id_and_mode(
+                        existing_id.clone(),
+                        &snapshot.messages,
+                        &snapshot.model,
+                        &snapshot.workspace,
+                        snapshot.total_tokens,
+                        snapshot.system_prompt.as_ref(),
+                        Some(snapshot.mode.as_str()),
+                    )
+                } else {
+                    return Err(ApiError::internal(format!(
+                        "Failed to load session {existing_id}: {e}"
+                    )));
+                }
+            }
+        }
+    } else {
+        crate::session_manager::create_saved_session_with_mode(
+            &snapshot.messages,
+            &snapshot.model,
+            &snapshot.workspace,
+            snapshot.total_tokens,
+            snapshot.system_prompt.as_ref(),
+            Some(snapshot.mode.as_str()),
+        )
+    };
+
+    // Save the session.
+    manager
+        .save_session(&session)
+        .map_err(|e| ApiError::internal(format!("Failed to save session: {e}")))?;
+
+    Ok(Json(SaveSessionResponse {
+        session_id: session.metadata.id.clone(),
+        session: session_to_detail(session),
+    }))
+}
+
+fn total_tokens_from_thread_detail(detail: &ThreadDetail) -> u64 {
+    detail
+        .turns
+        .iter()
+        .filter_map(|turn| turn.usage.as_ref())
+        .map(|usage| u64::from(usage.input_tokens) + u64::from(usage.output_tokens))
+        .sum()
+}
+
+fn session_title_override(requested: Option<&str>, thread_title: Option<&str>) -> Option<String> {
+    requested
+        .and_then(nonempty_title)
+        .or_else(|| thread_title.and_then(nonempty_title))
+}
+
+fn nonempty_title(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_text(trimmed, 50))
+    }
+}
+
+async fn delete_session(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let manager = SessionManager::new(state.sessions_dir.clone())
+        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+    manager
+        .delete_session(&id)
+        .map_err(|e| map_session_err(&id, e, "delete"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn session_to_detail(session: SavedSession) -> SessionDetailResponse {
+    let messages: Vec<serde_json::Value> = session
+        .messages
+        .iter()
+        .map(|msg| {
+            let content_blocks: Vec<serde_json::Value> = msg
+                .content
+                .iter()
+                .map(|block| match block {
+                    crate::models::ContentBlock::Text { text, .. } => {
+                        json!({ "type": "text", "text": text })
+                    }
+                    crate::models::ContentBlock::Thinking { thinking, .. } => {
+                        json!({ "type": "thinking", "text": thinking })
+                    }
+                    crate::models::ContentBlock::ToolUse { id, name, input, caller } => {
+                        let mut obj =
+                            json!({ "type": "tool_use", "id": id, "name": name, "input": input });
+                        if let Some(caller) = caller {
+                            obj["caller"] = json!(caller);
+                        }
+                        obj
+                    }
+                    crate::models::ContentBlock::ToolResult { tool_use_id, content, is_error, content_blocks, .. } => {
+                        let mut obj = json!({ "type": "tool_result", "tool_use_id": tool_use_id });
+                        if let Some(cbs) = content_blocks {
+                            obj["content_blocks"] = json!(cbs);
+                            if !content.is_empty() {
+                                obj["content"] = json!(content);
+                            }
+                        } else {
+                            obj["content"] = json!(content);
+                        }
+                        if let Some(e) = is_error {
+                            obj["is_error"] = json!(e);
+                        }
+                        obj
+                    }
+                    crate::models::ContentBlock::ServerToolUse { id, name, input } => {
+                        json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+                    }
+                    crate::models::ContentBlock::ToolSearchToolResult { tool_use_id, content } => {
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
+                    crate::models::ContentBlock::CodeExecutionToolResult { tool_use_id, content } => {
+                        json!({ "type": "tool_result", "tool_use_id": tool_use_id, "content": content })
+                    }
+                    crate::models::ContentBlock::ImageUrl { .. } => serde_json::Value::Null,
+                })
+                .collect();
+            json!({
+                "role": msg.role,
+                "content": content_blocks,
+            })
+        })
+        .collect();
+    SessionDetailResponse {
+        metadata: session.metadata,
+        messages,
+        system_prompt: session.system_prompt,
+    }
+}
+
+fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => ApiError::not_found(format!("Session '{id}' not found")),
+        std::io::ErrorKind::InvalidData => {
+            ApiError::bad_request(format!("Failed to parse session '{id}': {err}"))
+        }
+        std::io::ErrorKind::InvalidInput => {
+            ApiError::bad_request(format!("Invalid session id '{id}'"))
+        }
+        _ => ApiError::internal(format!("Failed to {action} session '{id}': {err}")),
+    }
+}
+
+async fn create_task(
+    State(state): State<RuntimeApiState>,
+    Json(mut req): Json<NewTaskRequest>,
+) -> Result<(StatusCode, Json<TaskRecord>), ApiError> {
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("prompt is required"));
+    }
+    if req.workspace.is_none() {
+        req.workspace = Some(state.workspace.clone());
+    }
+    if req.model.is_none() {
+        req.model = Some(
+            state
+                .config
+                .default_text_model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string()),
+        );
+    }
+    let task = state
+        .task_manager
+        .add_task(req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn create_thread(
+    State(state): State<RuntimeApiState>,
+    Json(mut req): Json<CreateThreadRequest>,
+) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
+    if req.model.as_ref().is_none_or(|m| m.trim().is_empty()) {
+        req.model = Some(
+            state
+                .config
+                .default_text_model
+                .clone()
+                .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string()),
+        );
+    }
+    if req.workspace.is_none() {
+        req.workspace = Some(state.workspace.clone());
+    }
+    if req.mode.as_ref().is_none_or(|m| m.trim().is_empty()) {
+        req.mode = Some("agent".to_string());
+    }
+
+    let thread = state
+        .runtime_threads
+        .create_thread(req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(thread)))
+}
+
+async fn list_threads(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<ThreadsQuery>,
+) -> Result<Json<Vec<ThreadRecord>>, ApiError> {
+    let filter = resolve_thread_filter(query.include_archived, query.archived_only);
+    let threads = state
+        .runtime_threads
+        .list_threads(filter, query.limit)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(threads))
+}
+
+async fn list_threads_summary(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<ThreadSummaryQuery>,
+) -> Result<Json<Vec<ThreadSummary>>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let search = query.search.as_deref().map(str::to_ascii_lowercase);
+    let filter = resolve_thread_filter(query.include_archived, query.archived_only);
+    let threads = state
+        .runtime_threads
+        .list_threads(filter, Some(limit))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let mut summaries = Vec::new();
+    for thread in threads {
+        let detail = state
+            .runtime_threads
+            .get_thread_detail(&thread.id)
+            .await
+            .map_err(map_thread_err)?;
+        let latest_turn = detail.turns.last();
+        let latest_status =
+            latest_turn.map(|turn| format!("{:?}", turn.status).to_ascii_lowercase());
+
+        let title = thread
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| truncate_text(t, 72))
+            .unwrap_or_else(|| {
+                latest_turn
+                    .map(|turn| {
+                        if turn.input_summary.trim().is_empty() {
+                            "New Thread".to_string()
+                        } else {
+                            truncate_text(&turn.input_summary, 72)
+                        }
+                    })
+                    .unwrap_or_else(|| "New Thread".to_string())
+            });
+
+        let preview = detail
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match item.kind {
+                TurnItemKind::AgentMessage | TurnItemKind::UserMessage => {
+                    let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
+                    if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(truncate_text(&text, 140))
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| title.clone());
+
+        if let Some(search) = &search {
+            let haystack = format!(
+                "{} {} {} {}",
+                thread.id.to_ascii_lowercase(),
+                title.to_ascii_lowercase(),
+                preview.to_ascii_lowercase(),
+                thread.model.to_ascii_lowercase()
+            );
+            if !haystack.contains(search) {
+                continue;
+            }
+        }
+
+        let workspace_git = collect_workspace_git_metadata(&thread.workspace);
+        summaries.push(ThreadSummary {
+            id: thread.id,
+            title,
+            preview,
+            model: thread.model,
+            mode: thread.mode,
+            branch: workspace_git.branch,
+            head: workspace_git.head,
+            dirty: workspace_git.dirty,
+            workspace: thread.workspace,
+            archived: thread.archived,
+            updated_at: thread.updated_at,
+            latest_turn_id: thread.latest_turn_id,
+            latest_turn_status: latest_status,
+        });
+    }
+
+    if summaries.len() > limit {
+        summaries.truncate(limit);
+    }
+
+    Ok(Json(summaries))
+}
+
+async fn workspace_status(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<WorkspaceStatusResponse>, ApiError> {
+    Ok(Json(collect_workspace_status(&state.workspace)))
+}
+
+async fn workspace_files(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<WorkspaceFilesQuery>,
+) -> Result<Json<WorkspaceFilesResponse>, ApiError> {
+    Ok(Json(collect_workspace_files(&state.workspace, query.path)?))
+}
+
+async fn workspace_file_content(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<WorkspaceFileContentQuery>,
+) -> Result<Json<WorkspaceFileContentResponse>, ApiError> {
+    Ok(Json(collect_workspace_file_content(
+        &state.workspace,
+        query.path,
+    )?))
+}
+
+async fn list_providers(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<ProvidersResponse>, ApiError> {
+    let config = state.runtime_threads.config_snapshot();
+    Ok(Json(collect_providers_response(&config)))
+}
+
+async fn test_provider_connection(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<ProviderTestRequest>,
+) -> Result<Json<ProviderTestResponse>, ApiError> {
+    let config = state.runtime_threads.config_snapshot();
+    Ok(Json(validate_provider_test_request(&config, request)?))
+}
+
+async fn apply_provider_connection(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<ProviderConnectionRequest>,
+) -> Result<Json<ProviderConnectionResponse>, ApiError> {
+    let config = state.runtime_threads.config_snapshot();
+    let (config, response) = apply_provider_connection_request(config, request)?;
+    state.runtime_threads.replace_config(config);
+    Ok(Json(response))
+}
+
+async fn list_agent_runs(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<AgentRunsResponse>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    Ok(Json(AgentRunsResponse { runs }))
+}
+
+async fn get_agent_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<AgentWorkerRecord>, ApiError> {
+    let runs = load_persisted_agent_worker_records(&state.workspace).map_err(|err| {
+        ApiError::internal(format!("Failed to load persisted agent run records: {err}"))
+    })?;
+    let run = runs
+        .into_iter()
+        .find(|record| {
+            let effective_run_id = if record.spec.run_id.is_empty() {
+                record.spec.worker_id.as_str()
+            } else {
+                record.spec.run_id.as_str()
+            };
+            effective_run_id == run_id || record.spec.worker_id == run_id
+        })
+        .ok_or_else(|| ApiError::not_found(format!("agent run '{run_id}' not found")))?;
+    Ok(Json(run))
+}
+
+async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let runs: Vec<_> = ledger_state
+        .runs
+        .values()
+        .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
+        .collect::<Result<Vec<_>, _>>()?;
+    let status = manager
+        .status()
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet status: {err}")))?;
+    Ok(Json(json!({
+        "status": fleet_status_json(&status),
+        "runs": runs,
+    })))
+}
+
+async fn get_fleet_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let run = ledger_state
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found(format!("fleet run '{run_id}' not found")))?;
+    Ok(Json(fleet_run_detail_json(&manager, run, &ledger_state)?))
+}
+
+async fn list_fleet_run_workers(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let ledger_state = manager
+        .rebuild_state()
+        .map_err(|err| ApiError::internal(format!("Failed to rebuild fleet state: {err}")))?;
+    let run = ledger_state
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::not_found(format!("fleet run '{run_id}' not found")))?;
+    let workers = run
+        .worker_specs
+        .iter()
+        .map(|worker| {
+            manager
+                .inspect_worker(&worker.id)
+                .map(|inspection| fleet_worker_json(&inspection))
+                .map_err(|err| {
+                    ApiError::internal(format!(
+                        "Failed to inspect fleet worker {}: {err}",
+                        worker.id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(json!({
+        "run_id": run_id,
+        "workers": workers,
+    })))
+}
+
+async fn get_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.inspect_worker(&worker_id).map_err(|err| {
+        ApiError::not_found(format!("fleet worker '{worker_id}' not found: {err}"))
+    })?;
+    Ok(Json(fleet_worker_json(&inspection)))
+}
+
+async fn interrupt_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.interrupt_worker(&worker_id).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Failed to interrupt fleet worker '{worker_id}': {err}"
+        ))
+    })?;
+    Ok(Json(json!({
+        "action": "interrupt",
+        "worker": fleet_worker_json(&inspection),
+    })))
+}
+
+async fn restart_fleet_worker(
+    State(state): State<RuntimeApiState>,
+    Path(worker_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let inspection = manager.restart_worker(&worker_id).map_err(|err| {
+        ApiError::bad_request(format!(
+            "Failed to restart fleet worker '{worker_id}': {err}"
+        ))
+    })?;
+    Ok(Json(json!({
+        "action": "restart",
+        "worker": fleet_worker_json(&inspection),
+    })))
+}
+
+async fn stop_fleet_run(
+    State(state): State<RuntimeApiState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let manager = open_fleet_manager(&state)?;
+    let run_id = FleetRunId::from(run_id);
+    let stopped = manager.stop_run(&run_id).map_err(|err| {
+        ApiError::bad_request(format!("Failed to stop fleet run '{}': {err}", run_id.0))
+    })?;
+    let status = manager
+        .run_status(&run_id)
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet run status: {err}")))?;
+    Ok(Json(json!({
+        "action": "stop",
+        "run_id": run_id.0,
+        "stopped": stopped,
+        "status": fleet_status_json(&status),
+    })))
+}
+
+fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {
+    FleetManager::open(&state.workspace)
+        .map_err(|err| ApiError::internal(format!("Failed to open fleet manager: {err}")))
+}
+
+fn fleet_run_summary_json(
+    manager: &FleetManager,
+    run: &FleetRun,
+    ledger_state: &FleetLedgerState,
+) -> Result<Value, ApiError> {
+    let status = manager
+        .run_status(&run.id)
+        .map_err(|err| ApiError::internal(format!("Failed to read fleet run status: {err}")))?;
+    let task_statuses = ledger_state
+        .tasks
+        .values()
+        .filter(|task| task.entry.run_id == run.id)
+        .map(|task| {
+            json!({
+                "task_id": task.entry.task_id.clone(),
+                "status": fleet_task_status_label(task.status),
+                "leased_to": task.leased_to.clone(),
+                "attempts": task.entry.attempts,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": run.id.0.clone(),
+        "name": run.name.clone(),
+        "status": fleet_status_json(&status),
+        "task_count": run.task_specs.len(),
+        "worker_count": run.worker_specs.len(),
+        "tasks": task_statuses,
+        "labels": run.labels.clone(),
+        "created_at": run.created_at.clone(),
+        "updated_at": run.updated_at.clone(),
+        "completed_at": run.completed_at.clone(),
+    }))
+}
+
+fn fleet_run_detail_json(
+    manager: &FleetManager,
+    run: &FleetRun,
+    ledger_state: &FleetLedgerState,
+) -> Result<Value, ApiError> {
+    let mut value = fleet_run_summary_json(manager, run, ledger_state)?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert("task_specs".to_string(), json!(run.task_specs.clone()));
+        map.insert("worker_specs".to_string(), json!(run.worker_specs.clone()));
+    }
+    Ok(value)
+}
+
+fn fleet_status_json(status: &FleetStatusSnapshot) -> Value {
+    json!({
+        "runs": status.runs,
+        "queued": status.queued,
+        "running": status.running,
+        "completed": status.completed,
+        "partial": status.partial,
+        "failed": status.failed,
+        "restarted": status.restarted,
+        "escalated": status.escalated,
+        "transport_failed": status.transport_failed,
+        "task_failed": status.task_failed,
+        "verifier_failed": status.verifier_failed,
+        "cancelled": status.cancelled,
+        "stale": status.stale,
+        "workers": status
+            .workers
+            .iter()
+            .map(|(worker_id, status)| {
+                (
+                    worker_id.clone(),
+                    Value::String(worker_status_label(status).to_string()),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })
+}
+
+fn fleet_worker_json(inspection: &FleetWorkerInspection) -> Value {
+    json!({
+        "worker_id": inspection.worker_id.clone(),
+        "status": worker_status_label(&inspection.status),
+        "run_id": inspection.current_run_id.as_ref().map(|run_id| run_id.0.clone()),
+        "task_id": inspection.current_task_id.clone(),
+        "objective": inspection.objective.clone(),
+        "role": inspection.role.clone(),
+        "host": inspection.host.clone(),
+        "latest_heartbeat_at": inspection.latest_heartbeat_at.clone(),
+        "latest_event": inspection.latest_event.as_ref().map(fleet_event_json),
+        "artifacts": inspection.artifacts.iter().map(fleet_artifact_json).collect::<Vec<_>>(),
+        "last_error": inspection.last_error.clone(),
+        "alert_state": inspection.alert_state.clone(),
+    })
+}
+
+fn fleet_artifact_json(artifact: &codewhale_protocol::fleet::FleetArtifactRef) -> Value {
+    json!({
+        "kind": artifact_kind_label(&artifact.kind),
+        "path": artifact.path.clone(),
+        "checksum": artifact.checksum.clone(),
+        "mime_type": artifact.mime_type.clone(),
+        "size_bytes": artifact.size_bytes,
+    })
+}
+
+fn fleet_event_json(event: &codewhale_protocol::fleet::FleetWorkerEvent) -> Value {
+    json!({
+        "seq": event.seq,
+        "run_id": event.run_id.0.clone(),
+        "worker_id": event.worker_id.clone(),
+        "task_id": event.task_id.clone(),
+        "timestamp": event.timestamp.clone(),
+        "label": fleet_event_label(&event.payload),
+        "payload": event.payload.clone(),
+    })
+}
+
+fn worker_status_label(status: &FleetWorkerStatus) -> &'static str {
+    match status {
+        FleetWorkerStatus::Unknown => "unknown",
+        FleetWorkerStatus::Online => "online",
+        FleetWorkerStatus::Busy => "busy",
+        FleetWorkerStatus::Offline => "offline",
+        FleetWorkerStatus::Unhealthy => "unhealthy",
+        FleetWorkerStatus::Draining => "draining",
+        FleetWorkerStatus::Retired => "retired",
+    }
+}
+
+fn fleet_task_status_label(status: FleetTaskLedgerStatus) -> &'static str {
+    match status {
+        FleetTaskLedgerStatus::Enqueued => "enqueued",
+        FleetTaskLedgerStatus::Leased => "leased",
+        FleetTaskLedgerStatus::Completed => "completed",
+        FleetTaskLedgerStatus::Failed => "failed",
+        FleetTaskLedgerStatus::Cancelled => "cancelled",
+    }
+}
+
+fn artifact_kind_label(kind: &FleetArtifactKind) -> String {
+    match kind {
+        FleetArtifactKind::Log => "log".to_string(),
+        FleetArtifactKind::Patch => "patch".to_string(),
+        FleetArtifactKind::TestResult => "test_result".to_string(),
+        FleetArtifactKind::Report => "report".to_string(),
+        FleetArtifactKind::Checkpoint => "checkpoint".to_string(),
+        FleetArtifactKind::Receipt => "receipt".to_string(),
+        FleetArtifactKind::Other(value) => value.clone(),
+    }
+}
+
+fn fleet_event_label(payload: &FleetWorkerEventPayload) -> String {
+    match payload {
+        FleetWorkerEventPayload::Queued => "queued".to_string(),
+        FleetWorkerEventPayload::Leased { .. } => "leased".to_string(),
+        FleetWorkerEventPayload::Starting => "starting".to_string(),
+        FleetWorkerEventPayload::Running => "running".to_string(),
+        FleetWorkerEventPayload::ModelWait { model } => model
+            .as_ref()
+            .map(|model| format!("model_wait model={model}"))
+            .unwrap_or_else(|| "model_wait".to_string()),
+        FleetWorkerEventPayload::RunningTool { tool, call_id } => call_id
+            .as_ref()
+            .map(|call_id| format!("running_tool tool={tool} call_id={call_id}"))
+            .unwrap_or_else(|| format!("running_tool tool={tool}")),
+        FleetWorkerEventPayload::Heartbeat { .. } => "heartbeat".to_string(),
+        FleetWorkerEventPayload::Artifact(artifact) => {
+            format!("artifact kind={}", artifact_kind_label(&artifact.kind))
+        }
+        FleetWorkerEventPayload::Completed { exit_code, summary } => match (exit_code, summary) {
+            (Some(code), Some(summary)) => format!("completed exit_code={code} {summary}"),
+            (Some(code), None) => format!("completed exit_code={code}"),
+            (None, Some(summary)) => format!("completed {summary}"),
+            (None, None) => "completed".to_string(),
+        },
+        FleetWorkerEventPayload::Failed {
+            reason,
+            recoverable,
+        } => {
+            format!("failed recoverable={recoverable} reason={reason}")
+        }
+        FleetWorkerEventPayload::Cancelled { cancelled_by } => cancelled_by
+            .as_ref()
+            .map(|by| format!("cancelled by={by}"))
+            .unwrap_or_else(|| "cancelled".to_string()),
+        FleetWorkerEventPayload::Interrupted { signal } => signal
+            .as_ref()
+            .map(|signal| format!("interrupted signal={signal}"))
+            .unwrap_or_else(|| "interrupted".to_string()),
+        FleetWorkerEventPayload::Stale { last_heartbeat_at } => last_heartbeat_at
+            .as_ref()
+            .map(|ts| format!("stale last_heartbeat_at={ts}"))
+            .unwrap_or_else(|| "stale".to_string()),
+        FleetWorkerEventPayload::Restarted { restart_count } => {
+            format!("restarted count={restart_count}")
+        }
+        FleetWorkerEventPayload::Escalated { channel, alert_id } => alert_id
+            .as_ref()
+            .map(|alert_id| format!("escalated channel={channel} alert_id={alert_id}"))
+            .unwrap_or_else(|| format!("escalated channel={channel}")),
+    }
+}
+
+async fn list_skills(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<SkillsResponse>, ApiError> {
+    let skills_dir = resolve_skills_dir(&state.config, &state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(&state.workspace, &skills_dir);
+    let skill_state = state.skill_state.lock().await;
+    let skills = registry
+        .list()
+        .iter()
+        .map(|skill| SkillEntry {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            path: skill.path.clone(),
+            enabled: skill_state.is_enabled(&skill.name),
+            is_bundled: skill_entry_is_bundled(skill, &skills_dir),
+        })
+        .collect();
+    Ok(Json(SkillsResponse {
+        directory: skills_dir,
+        directories,
+        warnings: registry.warnings().to_vec(),
+        skills,
+    }))
+}
+
+async fn set_skill_enabled(
+    State(state): State<RuntimeApiState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetSkillEnabledRequest>,
+) -> Result<Json<SetSkillEnabledResponse>, ApiError> {
+    let skills_dir = resolve_skills_dir(&state.config, &state.workspace);
+    let (registry, directories) = discover_skills_for_runtime_api(&state.workspace, &skills_dir);
+    let exists = registry.list().iter().any(|skill| skill.name == name);
+    if !exists {
+        return Err(ApiError::not_found(format!(
+            "skill '{name}' not found in searched directories: {}",
+            format_skill_search_paths(&directories)
+        )));
+    }
+
+    let mut store = state.skill_state.lock().await;
+    store
+        .set_enabled(&name, req.enabled)
+        .map_err(|err| ApiError::internal(format!("persist skill state: {err}")))?;
+    Ok(Json(SetSkillEnabledResponse {
+        name,
+        enabled: req.enabled,
+    }))
+}
+
+async fn decide_approval(
+    State(state): State<RuntimeApiState>,
+    Path(approval_id): Path<String>,
+    Json(req): Json<DecideApprovalBody>,
+) -> Result<Json<DecideApprovalResponse>, ApiError> {
+    let decision = match req.decision.as_str() {
+        "allow" => ExternalApprovalDecision::Allow {
+            remember: req.remember,
+        },
+        "deny" => ExternalApprovalDecision::Deny {
+            remember: req.remember,
+        },
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "invalid decision '{other}'; expected \"allow\" or \"deny\""
+            )));
+        }
+    };
+    let delivered = state
+        .runtime_threads
+        .deliver_external_approval(&approval_id, decision);
+    if !delivered {
+        return Err(ApiError::not_found(format!(
+            "no pending approval with id '{approval_id}'"
+        )));
+    }
+    Ok(Json(DecideApprovalResponse {
+        ok: true,
+        approval_id,
+        decision: req.decision,
+        delivered,
+    }))
+}
+
+async fn submit_user_input(
+    State(state): State<RuntimeApiState>,
+    Path((thread_id, input_id)): Path<(String, String)>,
+    Json(req): Json<SubmitUserInputBody>,
+) -> Result<Json<SubmitUserInputResponse>, ApiError> {
+    use crate::tools::user_input::{UserInputAnswer, UserInputResponse};
+    let answers: Vec<UserInputAnswer> = req
+        .answers
+        .into_iter()
+        .map(|a| UserInputAnswer {
+            id: a.id,
+            label: a.label,
+            value: a.value,
+        })
+        .collect();
+    let response = UserInputResponse { answers };
+    let delivered = state
+        .runtime_threads
+        .submit_user_input(&thread_id, &input_id, response)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(SubmitUserInputResponse {
+        ok: true,
+        input_id,
+        delivered,
+    }))
+}
+
+async fn runtime_info(State(state): State<RuntimeApiState>) -> Json<RuntimeInfoResponse> {
+    let version = env!("CARGO_PKG_VERSION");
+    Json(RuntimeInfoResponse {
+        service: "codewhale-runtime-api",
+        runtime_api_version: RUNTIME_API_VERSION,
+        codewhale_version: version,
+        bind_host: state.bind_host.clone(),
+        port: state.bind_port,
+        auth_required: state.auth_required,
+        transports: vec!["http", "sse"],
+        capabilities: default_runtime_capabilities(),
+        experimental: RuntimeExperimentalCapabilities::default(),
+        version,
+    })
+}
+
+async fn list_mcp_servers(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<McpServersResponse>, ApiError> {
+    let config = crate::mcp::load_config_with_workspace(&state.mcp_config_path, &state.workspace)
+        .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let mut pool = McpPool::new(config.clone());
+    let _errors = pool.connect_all().await;
+    let connected: HashSet<String> = pool
+        .connected_servers()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let mut servers = Vec::new();
+    for (name, server_cfg) in config.servers {
+        servers.push(McpServerEntry {
+            name: name.clone(),
+            enabled: server_cfg.is_enabled(),
+            required: server_cfg.required,
+            command: server_cfg.command.clone(),
+            url: server_cfg.url.clone(),
+            connected: connected.contains(&name),
+            enabled_tools: server_cfg.enabled_tools.clone(),
+            disabled_tools: server_cfg.disabled_tools.clone(),
+        });
+    }
+    servers.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(Json(McpServersResponse { servers }))
+}
+
+async fn list_mcp_tools(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<McpToolsQuery>,
+) -> Result<Json<McpToolsResponse>, ApiError> {
+    let mut pool =
+        McpPool::from_config_path_with_workspace(&state.mcp_config_path, &state.workspace)
+            .map_err(|e| ApiError::internal(format!("Failed to load MCP config: {e}")))?;
+    let _errors = pool.connect_all().await;
+
+    let mut tools = Vec::new();
+    for (prefixed_name, tool) in pool.all_tools() {
+        let Ok((server, name)) = pool.parse_prefixed_name(&prefixed_name) else {
+            continue;
+        };
+
+        if let Some(filter) = query.server.as_deref()
+            && server != filter
+        {
+            continue;
+        }
+
+        tools.push(McpToolEntry {
+            server: server.to_string(),
+            name: name.to_string(),
+            prefixed_name,
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+        });
+    }
+
+    tools.sort_by(|a, b| a.server.cmp(&b.server).then_with(|| a.name.cmp(&b.name)));
+
+    Ok(Json(McpToolsResponse { tools }))
+}
+
+async fn list_automations(
+    State(state): State<RuntimeApiState>,
+) -> Result<Json<Vec<AutomationRecord>>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automations = manager
+        .list_automations()
+        .map_err(|e| ApiError::internal(format!("Failed to list automations: {e}")))?;
+    Ok(Json(automations))
+}
+
+async fn create_automation(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<CreateAutomationRequest>,
+) -> Result<(StatusCode, Json<AutomationRecord>), ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager
+        .create_automation(req)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((StatusCode::CREATED, Json(automation)))
+}
+
+async fn get_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<AutomationRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager.get_automation(&id).map_err(map_automation_err)?;
+    Ok(Json(automation))
+}
+
+async fn update_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateAutomationRequest>,
+) -> Result<Json<AutomationRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager
+        .update_automation(&id, req)
+        .map_err(map_automation_err)?;
+    Ok(Json(automation))
+}
+
+async fn delete_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<AutomationRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager.delete_automation(&id).map_err(map_automation_err)?;
+    Ok(Json(automation))
+}
+
+async fn run_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<AutomationRunRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let run = manager
+        .run_now(&id, &state.task_manager)
+        .await
+        .map_err(map_automation_err)?;
+    Ok(Json(run))
+}
+
+async fn pause_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<AutomationRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager.pause_automation(&id).map_err(map_automation_err)?;
+    Ok(Json(automation))
+}
+
+async fn resume_automation(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<AutomationRecord>, ApiError> {
+    let manager = state.automations.lock().await;
+    let automation = manager.resume_automation(&id).map_err(map_automation_err)?;
+    Ok(Json(automation))
+}
+
+async fn list_automation_runs(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<AutomationRunsQuery>,
+) -> Result<Json<Vec<AutomationRunRecord>>, ApiError> {
+    let manager = state.automations.lock().await;
+    let runs = manager
+        .list_runs(&id, query.limit)
+        .map_err(map_automation_err)?;
+    Ok(Json(runs))
+}
+
+async fn get_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ThreadDetail>, ApiError> {
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(detail))
+}
+
+async fn update_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateThreadRequest>,
+) -> Result<Json<ThreadRecord>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .update_thread(&id, req)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(thread))
+}
+
+async fn resume_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<ThreadRecord>, ApiError> {
+    let thread = state
+        .runtime_threads
+        .resume_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(thread))
+}
+
+async fn fork_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<ThreadRecord>), ApiError> {
+    let thread = state
+        .runtime_threads
+        .fork_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((StatusCode::CREATED, Json(thread)))
+}
+
+#[derive(Debug, Deserialize)]
+struct UndoTurnRequest {
+    /// How many turns back to undo (default 0 = last turn only).
+    #[serde(default)]
+    depth: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct UndoTurnResponse {
+    /// The new forked thread (with the last N turns removed).
+    thread: ThreadRecord,
+    /// The original user message text from the first dropped turn,
+    /// so the GUI can pre-populate the input box.
+    original_user_text: Option<String>,
+}
+
+async fn undo_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UndoTurnRequest>,
+) -> Result<(StatusCode, Json<UndoTurnResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(UndoTurnResponse {
+            thread: forked_thread,
+            original_user_text,
+        }),
+    ))
+}
+
+/// Result of the snapshot-based file rollback step of patch-undo, reported
+/// alongside the new forked thread.
+#[derive(Debug, Serialize)]
+struct PatchUndoResult {
+    /// Whether files were restored from a snapshot.
+    files_restored: bool,
+    /// Human-readable summary of what was restored (diff stat).
+    summary: Option<String>,
+    /// The label of the restored snapshot (e.g. "tool:apply_patch" or "pre-turn:3").
+    snapshot_label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchUndoResponse {
+    /// Result of the snapshot-based file rollback step.
+    patch_result: PatchUndoResult,
+    /// The new forked thread (with the last turn removed).
+    thread: ThreadRecord,
+    /// The original user text from the removed turn (for re-editing).
+    original_user_text: Option<String>,
+}
+
+async fn patch_undo_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<UndoTurnRequest>,
+) -> Result<(StatusCode, Json<PatchUndoResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+
+    // Step 1: Try snapshot-based file rollback (patch_undo).
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let patch_result = patch_undo_workspace_files(&thread.workspace);
+
+    // Step 2: Remove the last conversation turn (undo_conversation).
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PatchUndoResponse {
+            patch_result,
+            thread: forked_thread,
+            original_user_text,
+        }),
+    ))
+}
+
+/// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
+/// current workspace — same target selection as the TUI's `patch_undo`.
+fn patch_undo_workspace_files(workspace: &FsPath) -> PatchUndoResult {
+    let repo = match crate::snapshot::SnapshotRepo::open_or_init(workspace) {
+        Ok(repo) => repo,
+        Err(e) => {
+            return PatchUndoResult {
+                files_restored: false,
+                summary: Some(format!("Snapshot repo unavailable: {e}")),
+                snapshot_label: None,
+            };
+        }
+    };
+    let snapshots = match repo.list(20) {
+        Ok(snapshots) => snapshots,
+        Err(e) => {
+            return PatchUndoResult {
+                files_restored: false,
+                summary: Some(format!("Failed to list snapshots: {e}")),
+                snapshot_label: None,
+            };
+        }
+    };
+    let target = snapshots
+        .iter()
+        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
+        .find(|s| matches!(repo.work_tree_matches_snapshot(&s.id), Ok(false) | Err(_)));
+    let Some(target) = target else {
+        return PatchUndoResult {
+            files_restored: false,
+            summary: Some(
+                "No older tool or pre-turn snapshots differ from the current workspace."
+                    .to_string(),
+            ),
+            snapshot_label: None,
+        };
+    };
+    if let Err(e) = repo.restore(&target.id) {
+        return PatchUndoResult {
+            files_restored: false,
+            summary: Some(format!("Restore failed: {e}")),
+            snapshot_label: None,
+        };
+    }
+
+    // Compute a diff stat for the summary.
+    use crate::dependencies::{ExternalTool as _, Git};
+    let diff_stat = Git::command().and_then(|mut git| {
+        git.args(["diff", "--stat"])
+            .current_dir(workspace)
+            .output()
+            .ok()
+            .and_then(|o| {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            })
+    });
+
+    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
+    let summary = match diff_stat {
+        Some(ref stat) => format!(
+            "Restored snapshot '{}' ({}). Files affected:\n{stat}",
+            target.label, short
+        ),
+        None => format!(
+            "Restored snapshot '{}' ({}). No diff changes detected.",
+            target.label, short
+        ),
+    };
+    PatchUndoResult {
+        files_restored: true,
+        summary: Some(summary),
+        snapshot_label: Some(target.label.clone()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RetryTurnRequest {
+    /// How many turns back to retry (default 0 = last turn only).
+    #[serde(default)]
+    depth: Option<usize>,
+    /// Override the user message text. If omitted, the original text
+    /// from the dropped turn is re-used.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RetryTurnResponse {
+    /// The new forked thread (with the last N turns removed).
+    thread: ThreadRecord,
+    /// The turn created by the retry.
+    turn: TurnRecord,
+}
+
+async fn retry_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<RetryTurnRequest>,
+) -> Result<(StatusCode, Json<RetryTurnResponse>), ApiError> {
+    let depth = req.depth.unwrap_or(0);
+    let (forked_thread, original_user_text) = state
+        .runtime_threads
+        .fork_at_user_message(&id, depth)
+        .await
+        .map_err(map_thread_err)?;
+
+    let retry_prompt = req.prompt.or(original_user_text).unwrap_or_default();
+    if retry_prompt.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "No user message to retry — the dropped turn had no user text",
+        ));
+    }
+
+    let turn = state
+        .runtime_threads
+        .start_turn(
+            &forked_thread.id,
+            StartTurnRequest {
+                prompt: retry_prompt,
+                input_summary: None,
+                model: None,
+                mode: None,
+                allow_shell: None,
+                trust_mode: None,
+                auto_approve: None,
+                dynamic_tools: Vec::new(),
+                environment_id: None,
+            },
+        )
+        .await
+        .map_err(map_thread_err)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(RetryTurnResponse {
+            thread: forked_thread,
+            turn,
+        }),
+    ))
+}
+
+async fn start_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<StartTurnRequest>,
+) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
+    let turn = state
+        .runtime_threads
+        .start_turn(&id, req)
+        .await
+        .map_err(map_thread_err)?;
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(StartTurnResponse { thread, turn }),
+    ))
+}
+
+async fn list_teaching_events(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<TeachingEventsQuery>,
+) -> Result<Json<TeachingEventsResponse>, ApiError> {
+    let _ = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let since = query
+        .since
+        .as_deref()
+        .map(|raw| parse_iso8601(raw, "since"))
+        .transpose()?;
+    let runtime_events = state
+        .runtime_threads
+        .events_since(&id, query.after_seq)
+        .map_err(|err| ApiError::internal(format!("Failed to load teaching events: {err}")))?;
+    let mut events: Vec<TeachingEventEntry> = runtime_events
+        .into_iter()
+        .filter(|event| since.is_none_or(|since| event.timestamp > since))
+        .filter_map(teaching_event_from_runtime_event)
+        .collect();
+    if let Some(limit) = query.limit {
+        if limit > 500 {
+            return Err(ApiError::bad_request("limit must be <= 500"));
+        }
+        if events.len() > limit {
+            events = events.split_off(events.len() - limit);
+        }
+    }
+    let latest_seq = events.last().map(|event| event.seq).unwrap_or(0);
+
+    Ok(Json(TeachingEventsResponse {
+        thread_id: id,
+        latest_seq,
+        events,
+    }))
+}
+
+async fn stream_teaching_events(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<TeachingEventsQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let _ = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    let since = query
+        .since
+        .as_deref()
+        .map(|raw| parse_iso8601(raw, "since"))
+        .transpose()?;
+    let mut backlog: Vec<TeachingEventEntry> = state
+        .runtime_threads
+        .events_since(&id, query.after_seq)
+        .map_err(|err| ApiError::internal(format!("Failed to load teaching events: {err}")))?
+        .into_iter()
+        .filter(|event| since.is_none_or(|since| event.timestamp > since))
+        .filter_map(teaching_event_from_runtime_event)
+        .collect();
+    if let Some(limit) = query.limit {
+        if limit > 500 {
+            return Err(ApiError::bad_request("limit must be <= 500"));
+        }
+        if backlog.len() > limit {
+            backlog = backlog.split_off(backlog.len() - limit);
+        }
+    }
+    let mut last_seq = query.after_seq.unwrap_or(0);
+    if let Some(last) = backlog.last() {
+        last_seq = last.seq;
+    }
+
+    let mut live = state.runtime_threads.subscribe_events();
+    let thread_id = id.clone();
+    let stream = stream! {
+        for event in backlog {
+            yield Ok(sse_json("teaching.event", serde_json::to_value(event).unwrap_or_else(|_| json!({}))));
+        }
+        loop {
+            let incoming = live.recv().await;
+            let Ok(event) = incoming else {
+                break;
+            };
+            if event.thread_id != thread_id || event.seq <= last_seq {
+                continue;
+            }
+            last_seq = event.seq;
+            let Some(event) = teaching_event_from_runtime_event(event) else {
+                continue;
+            };
+            yield Ok(sse_json("teaching.event", serde_json::to_value(event).unwrap_or_else(|_| json!({}))));
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn steer_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path((id, turn_id)): Path<(String, String)>,
+    Json(req): Json<SteerTurnRequest>,
+) -> Result<Json<TurnRecord>, ApiError> {
+    let turn = state
+        .runtime_threads
+        .steer_turn(&id, &turn_id, req)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(turn))
+}
+
+async fn interrupt_thread_turn(
+    State(state): State<RuntimeApiState>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<TurnRecord>, ApiError> {
+    let turn = state
+        .runtime_threads
+        .interrupt_turn(&id, &turn_id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok(Json(turn))
+}
+
+async fn compact_thread(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Json(req): Json<CompactThreadRequest>,
+) -> Result<(StatusCode, Json<StartTurnResponse>), ApiError> {
+    let turn = state
+        .runtime_threads
+        .compact_thread(&id, req)
+        .await
+        .map_err(map_thread_err)?;
+    let thread = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(StartTurnResponse { thread, turn }),
+    ))
+}
+
+async fn list_tasks(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<TasksQuery>,
+) -> Result<Json<TasksResponse>, ApiError> {
+    let tasks = state.task_manager.list_tasks(query.limit).await;
+    let counts = state.task_manager.counts().await;
+    Ok(Json(TasksResponse { tasks, counts }))
+}
+
+async fn get_task(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskRecord>, ApiError> {
+    let task = state
+        .task_manager
+        .get_task(&id)
+        .await
+        .map_err(map_task_err)?;
+    Ok(Json(task))
+}
+
+async fn cancel_task(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<TaskRecord>, ApiError> {
+    let task = state
+        .task_manager
+        .cancel_task(&id)
+        .await
+        .map_err(map_task_err)?;
+    Ok(Json(task))
+}
+
+async fn stream_thread_events(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<ThreadEventsQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    let _ = state
+        .runtime_threads
+        .get_thread(&id)
+        .await
+        .map_err(map_thread_err)?;
+
+    let mut backlog = state
+        .runtime_threads
+        .events_since(&id, query.since_seq)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Some(limit) = query.replay_limit
+        && backlog.len() > limit
+    {
+        backlog = backlog.split_off(backlog.len() - limit);
+    }
+    let mut last_seq = query.since_seq.unwrap_or(0);
+    if let Some(last) = backlog.last() {
+        last_seq = last.seq;
+    }
+
+    let mut live = state.runtime_threads.subscribe_events();
+    let thread_id = id.clone();
+    let stream = stream! {
+        for event in backlog {
+            let event_name = event.event.clone();
+            yield Ok(sse_json(&event_name, runtime_event_payload(event)));
+        }
+        loop {
+            let incoming = live.recv().await;
+            let Ok(event) = incoming else {
+                break;
+            };
+            if event.thread_id != thread_id {
+                continue;
+            }
+            if event.seq <= last_seq {
+                continue;
+            }
+            last_seq = event.seq;
+            let event_name = event.event.clone();
+            yield Ok(sse_json(&event_name, runtime_event_payload(event)));
+        }
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+async fn stream_turn(
+    State(state): State<RuntimeApiState>,
+    Json(req): Json<StreamTurnRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<SseEvent, Infallible>>>, ApiError> {
+    if req.prompt.trim().is_empty() {
+        return Err(ApiError::bad_request("prompt is required"));
+    }
+
+    let model = req.model.clone().unwrap_or_else(|| {
+        state
+            .config
+            .default_text_model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TEXT_MODEL.to_string())
+    });
+    let workspace = req
+        .workspace
+        .clone()
+        .unwrap_or_else(|| state.workspace.clone());
+    let mode = req.mode.clone().unwrap_or_else(|| "agent".to_string());
+    let allow_shell = req.allow_shell.unwrap_or(state.config.allow_shell());
+    let trust_mode = req.trust_mode.unwrap_or(false);
+    let auto_approve = req.auto_approve.unwrap_or(false);
+    let prompt = req.prompt;
+
+    let thread = state
+        .runtime_threads
+        .create_thread(CreateThreadRequest {
+            model: Some(model.clone()),
+            workspace: Some(workspace.clone()),
+            mode: Some(mode.clone()),
+            allow_shell: Some(allow_shell),
+            trust_mode: Some(trust_mode),
+            auto_approve: Some(auto_approve),
+            archived: true,
+            system_prompt: None,
+            task_id: None,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to create stream thread: {e}")))?;
+
+    let turn = state
+        .runtime_threads
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt,
+                input_summary: None,
+                model: Some(model.clone()),
+                mode: Some(mode.clone()),
+                allow_shell: Some(allow_shell),
+                trust_mode: Some(trust_mode),
+                auto_approve: Some(auto_approve),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to start stream turn: {e}")))?;
+
+    let backlog = state
+        .runtime_threads
+        .events_since(&thread.id, None)
+        .map_err(|e| ApiError::internal(format!("Failed to load stream backlog: {e}")))?;
+    let mut live = state.runtime_threads.subscribe_events();
+    let thread_id = thread.id.clone();
+    let turn_id = turn.id.clone();
+
+    let stream = stream! {
+        yield Ok(sse_json("turn.started", json!({
+            "thread_id": thread.id,
+            "turn_id": turn.id,
+            "model": model,
+            "mode": mode,
+            "workspace": workspace,
+        })));
+
+        for event in backlog {
+            if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
+                continue;
+            }
+            if let Some(mapped) = map_compat_stream_event(&event) {
+                yield Ok(mapped);
+            }
+            if event.event == "turn.completed" {
+                yield Ok(sse_json("done", json!({})));
+                return;
+            }
+        }
+
+        loop {
+            let incoming = live.recv().await;
+            let Ok(event) = incoming else {
+                yield Ok(sse_json("error", json!({ "message": "event channel closed" })));
+                break;
+            };
+            if event.thread_id != thread_id || event.turn_id.as_deref() != Some(&turn_id) {
+                continue;
+            }
+            if let Some(mapped) = map_compat_stream_event(&event) {
+                yield Ok(mapped);
+            }
+            if event.event == "turn.completed" {
+                break;
+            }
+        }
+
+        yield Ok(sse_json("done", json!({})));
+    };
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+fn runtime_event_payload(event: crate::runtime_threads::RuntimeEventRecord) -> serde_json::Value {
+    let event_name = event.event.clone();
+    let timestamp = event.timestamp.to_rfc3339();
+    let schema_version = RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION;
+    let envelope = RuntimeEventEnvelope {
+        schema_version,
+        seq: event.seq,
+        event: event_name.clone(),
+        kind: event_name,
+        thread_id: event.thread_id,
+        turn_id: event.turn_id,
+        item_id: event.item_id,
+        timestamp: timestamp.clone(),
+        created_at: Some(timestamp),
+        payload: redact_json_value(event.payload),
+        extra: Default::default(),
+    };
+    serde_json::to_value(envelope).expect("serialize runtime event envelope")
+}
+
+fn teaching_event_from_runtime_event(
+    event: crate::runtime_threads::RuntimeEventRecord,
+) -> Option<TeachingEventEntry> {
+    let (event_type, category, actor, visibility, severity, summary, data) =
+        teaching_projection_for_runtime_event(&event)?;
+    Some(TeachingEventEntry {
+        seq: event.seq,
+        id: format!("edu-{}", event.seq),
+        session_id: event.thread_id,
+        event_type,
+        timestamp: event.timestamp.to_rfc3339(),
+        category,
+        actor,
+        visibility,
+        severity,
+        summary: redact_text(&summary),
+        data: redact_json_value(data),
+    })
+}
+
+fn teaching_projection_for_runtime_event(
+    event: &crate::runtime_threads::RuntimeEventRecord,
+) -> Option<(
+    EducationEventType,
+    &'static str,
+    EducationActor,
+    EducationVisibility,
+    EducationSeverity,
+    String,
+    Value,
+)> {
+    match event.event.as_str() {
+        "thread.started" => Some((
+            EducationEventType::SessionStarted,
+            "Context",
+            EducationActor::System,
+            EducationVisibility::Student,
+            EducationSeverity::Info,
+            "Started runtime thread".to_string(),
+            event.payload.clone(),
+        )),
+        "turn.started" => Some((
+            EducationEventType::ContextUpdated,
+            "Context",
+            EducationActor::Student,
+            EducationVisibility::Student,
+            EducationSeverity::Info,
+            "Started model turn".to_string(),
+            event.payload.clone(),
+        )),
+        "turn.completed" => Some((
+            EducationEventType::ContextUpdated,
+            "Context",
+            EducationActor::System,
+            EducationVisibility::Student,
+            if event
+                .payload
+                .get("turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                == Some("failed")
+            {
+                EducationSeverity::Error
+            } else {
+                EducationSeverity::Info
+            },
+            "Completed model turn".to_string(),
+            event.payload.clone(),
+        )),
+        "item.started" => {
+            let item = event.payload.get("item")?;
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+            let tool_name = event
+                .payload
+                .get("tool")
+                .and_then(|tool| tool.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or(kind);
+            let (event_type, category, summary) = if kind == "command_execution"
+                || matches!(tool_name, "exec_shell" | "task_shell_start")
+            {
+                (
+                    EducationEventType::ShellStarted,
+                    "Shell",
+                    format!("Started shell command {tool_name}"),
+                )
+            } else if kind == "file_change" {
+                (
+                    EducationEventType::FileChanged,
+                    "Files",
+                    "Started file update".to_string(),
+                )
+            } else {
+                (
+                    EducationEventType::ToolStarted,
+                    "Tools",
+                    format!("Started tool {tool_name}"),
+                )
+            };
+            Some((
+                event_type,
+                category,
+                EducationActor::Agent,
+                EducationVisibility::Student,
+                EducationSeverity::Info,
+                summary,
+                event.payload.clone(),
+            ))
+        }
+        "item.completed" | "item.failed" => {
+            let item = event.payload.get("item")?;
+            let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
+            let summary = item
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("Completed runtime item")
+                .to_string();
+            let severity = if event.event == "item.failed" {
+                EducationSeverity::Error
+            } else {
+                EducationSeverity::Info
+            };
+            let (event_type, category) = match kind {
+                "command_execution" => (EducationEventType::ShellFinished, "Shell"),
+                "file_change" => (EducationEventType::FileChanged, "Files"),
+                "error" => (EducationEventType::SafetyBlocked, "Safety"),
+                _ => (EducationEventType::ToolFinished, "Tools"),
+            };
+            Some((
+                event_type,
+                category,
+                EducationActor::Agent,
+                EducationVisibility::Student,
+                severity,
+                summary,
+                event.payload.clone(),
+            ))
+        }
+        "approval.required" => Some((
+            EducationEventType::ApprovalRequested,
+            "Safety",
+            EducationActor::System,
+            EducationVisibility::Teacher,
+            EducationSeverity::Warning,
+            event
+                .payload
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Approval required")
+                .to_string(),
+            event.payload.clone(),
+        )),
+        "approval.decided" | "approval.timeout" => Some((
+            EducationEventType::ApprovalResolved,
+            "Safety",
+            EducationActor::System,
+            EducationVisibility::Teacher,
+            EducationSeverity::Info,
+            "Approval resolved".to_string(),
+            event.payload.clone(),
+        )),
+        "sandbox.denied" => Some((
+            EducationEventType::SafetyBlocked,
+            "Safety",
+            EducationActor::System,
+            EducationVisibility::Teacher,
+            EducationSeverity::Warning,
+            "Sandbox denied an operation".to_string(),
+            event.payload.clone(),
+        )),
+        _ => None,
+    }
+}
+
+fn redact_json_value(value: Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_text(&text)),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, redact_json_value(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn map_compat_stream_event(event: &crate::runtime_threads::RuntimeEventRecord) -> Option<SseEvent> {
+    let payload = &event.payload;
+    match event.event.as_str() {
+        "item.delta" => {
+            let kind = payload
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if kind == "agent_message" {
+                let content = payload
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                Some(sse_json("message.delta", json!({ "content": content })))
+            } else if kind == "tool_call" {
+                let output = payload
+                    .get("delta")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                Some(sse_json("tool.progress", json!({ "output": output })))
+            } else {
+                None
+            }
+        }
+        "item.started" => {
+            let tool = payload.get("tool")?;
+            let id = tool.get("id").cloned().unwrap_or(Value::Null);
+            let name = tool.get("name").cloned().unwrap_or(Value::Null);
+            let input = tool.get("input").cloned().unwrap_or(Value::Null);
+            Some(sse_json(
+                "tool.started",
+                json!({
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }),
+            ))
+        }
+        "item.completed" | "item.failed" => {
+            let item = payload.get("item")?;
+            let kind = item
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if kind == "tool_call" || kind == "file_change" || kind == "command_execution" {
+                let id = item.get("id").cloned().unwrap_or(Value::Null);
+                let success = event.event == "item.completed";
+                let output = item.get("detail").cloned().unwrap_or_else(|| {
+                    Value::String(
+                        item.get("summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                });
+                Some(sse_json(
+                    "tool.completed",
+                    json!({
+                        "id": id,
+                        "success": success,
+                        "output": output,
+                    }),
+                ))
+            } else if kind == "status" {
+                let message = item
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("summary").and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+                Some(sse_json("status", json!({ "message": message })))
+            } else if kind == "error" {
+                let message = item
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("summary").and_then(|v| v.as_str()))
+                    .unwrap_or_default();
+                Some(sse_json("error", json!({ "message": message })))
+            } else {
+                None
+            }
+        }
+        "approval.required" => Some(sse_json("approval.required", payload.clone())),
+        "approval.decided" => Some(sse_json("approval.decided", payload.clone())),
+        "approval.timeout" => Some(sse_json("approval.timeout", payload.clone())),
+        "sandbox.denied" => Some(sse_json("sandbox.denied", payload.clone())),
+        "turn.completed" => {
+            let usage = payload
+                .get("turn")
+                .and_then(|turn| turn.get("usage"))
+                .cloned()
+                .unwrap_or(json!(null));
+            Some(sse_json("turn.completed", json!({ "usage": usage })))
+        }
+        _ => None,
+    }
+}
+
+fn sse_json(event: &str, payload: serde_json::Value) -> SseEvent {
+    let data = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    SseEvent::default().event(event).data(data)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{truncated}...")
+}
+
+fn collect_workspace_status(workspace: &std::path::Path) -> WorkspaceStatusResponse {
+    let mut status = WorkspaceStatusResponse {
+        workspace: workspace.to_path_buf(),
+        git_repo: false,
+        branch: None,
+        head: None,
+        dirty: false,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        ahead: None,
+        behind: None,
+    };
+
+    let Some(repo_check) = run_git(workspace, &["rev-parse", "--is-inside-work-tree"]) else {
+        return status;
+    };
+    if repo_check.trim() != "true" {
+        return status;
+    }
+
+    status.git_repo = true;
+    let metadata = collect_workspace_git_metadata(workspace);
+    status.branch = metadata.branch;
+    status.head = metadata.head;
+    status.dirty = metadata.dirty;
+
+    if let Some(porcelain) = run_git(workspace, &["status", "--porcelain=v1"]) {
+        for line in porcelain.lines() {
+            if line.starts_with("??") {
+                status.untracked += 1;
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            if chars.len() >= 2 {
+                if chars[0] != ' ' {
+                    status.staged += 1;
+                }
+                if chars[1] != ' ' {
+                    status.unstaged += 1;
+                }
+            }
+        }
+    }
+
+    if let Some(counts) = run_git(
+        workspace,
+        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
+    ) {
+        let mut parts = counts.split_whitespace();
+        if let (Some(behind), Some(ahead)) = (parts.next(), parts.next()) {
+            status.behind = behind.parse::<u32>().ok();
+            status.ahead = ahead.parse::<u32>().ok();
+        }
+    }
+
+    status
+}
+
+fn collect_workspace_files(
+    workspace: &std::path::Path,
+    path: Option<String>,
+) -> Result<WorkspaceFilesResponse, ApiError> {
+    let relative_path = normalize_workspace_relative_path(path.as_deref())?;
+    let workspace_root = fs::canonicalize(workspace).map_err(|err| {
+        ApiError::internal(format!(
+            "Failed to resolve workspace '{}': {err}",
+            workspace.display()
+        ))
+    })?;
+    let target = workspace_root.join(&relative_path);
+    let target = fs::canonicalize(&target).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found(format!(
+                "Workspace path '{}' not found",
+                display_workspace_relative_path(&relative_path)
+            ))
+        } else {
+            ApiError::bad_request(format!(
+                "Failed to resolve workspace path '{}': {err}",
+                display_workspace_relative_path(&relative_path)
+            ))
+        }
+    })?;
+    if !target.starts_with(&workspace_root) {
+        return Err(workspace_path_escape_error(
+            path.as_deref().unwrap_or_default(),
+        ));
+    }
+    if !target.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "Workspace path '{}' is not a directory",
+            display_workspace_relative_path(&relative_path)
+        )));
+    }
+
+    let mut entries = Vec::new();
+    let read_dir = fs::read_dir(&target).map_err(|err| {
+        ApiError::internal(format!(
+            "Failed to read workspace directory '{}': {err}",
+            display_workspace_relative_path(&relative_path)
+        ))
+    })?;
+    for entry in read_dir {
+        let entry = entry
+            .map_err(|err| ApiError::internal(format!("Failed to read directory entry: {err}")))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if should_hide_workspace_entry(&name) {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|err| ApiError::internal(format!("Failed to inspect '{name}': {err}")))?;
+        let kind = if metadata.is_dir() {
+            WorkspaceFileKind::Directory
+        } else if metadata.is_file() {
+            WorkspaceFileKind::File
+        } else if metadata.file_type().is_symlink() {
+            WorkspaceFileKind::Symlink
+        } else {
+            WorkspaceFileKind::Other
+        };
+        let entry_relative = relative_path.join(&name);
+        entries.push(WorkspaceFileEntry {
+            name,
+            path: display_workspace_relative_path(&entry_relative),
+            has_children: (kind == WorkspaceFileKind::Directory).then_some(true),
+            size: (kind == WorkspaceFileKind::File).then_some(metadata.len()),
+            modified_at: metadata.modified().ok().map(chrono::DateTime::<Utc>::from),
+            kind,
+        });
+    }
+    entries.sort_by(|a, b| {
+        let a_rank = if a.kind == WorkspaceFileKind::Directory {
+            0
+        } else {
+            1
+        };
+        let b_rank = if b.kind == WorkspaceFileKind::Directory {
+            0
+        } else {
+            1
+        };
+        a_rank.cmp(&b_rank).then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(WorkspaceFilesResponse {
+        workspace: workspace_root,
+        parent: relative_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(display_workspace_relative_path),
+        path: display_workspace_relative_path(&relative_path),
+        entries,
+    })
+}
+
+fn collect_workspace_file_content(
+    workspace: &std::path::Path,
+    path: String,
+) -> Result<WorkspaceFileContentResponse, ApiError> {
+    let relative_path = normalize_workspace_relative_path(Some(&path))?;
+    if relative_path.as_os_str().is_empty() {
+        return Err(ApiError::bad_request("path is required"));
+    }
+    let workspace_root = fs::canonicalize(workspace).map_err(|err| {
+        ApiError::internal(format!(
+            "Failed to resolve workspace '{}': {err}",
+            workspace.display()
+        ))
+    })?;
+    let target = workspace_root.join(&relative_path);
+    let target = fs::canonicalize(&target).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ApiError::not_found(format!(
+                "Workspace file '{}' not found",
+                display_workspace_relative_path(&relative_path)
+            ))
+        } else {
+            ApiError::bad_request(format!(
+                "Failed to resolve workspace file '{}': {err}",
+                display_workspace_relative_path(&relative_path)
+            ))
+        }
+    })?;
+    if !target.starts_with(&workspace_root) {
+        return Err(workspace_path_escape_error(&path));
+    }
+    let metadata = fs::metadata(&target).map_err(|err| {
+        ApiError::internal(format!(
+            "Failed to inspect workspace file '{}': {err}",
+            display_workspace_relative_path(&relative_path)
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "Workspace path '{}' is not a file",
+            display_workspace_relative_path(&relative_path)
+        )));
+    }
+
+    let bytes = match fs::read(&target) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(WorkspaceFileContentResponse {
+                path: display_workspace_relative_path(&relative_path),
+                kind: WorkspaceFilePreviewKind::Unreadable,
+                encoding: None,
+                size: metadata.len(),
+                truncated: false,
+                max_bytes: WORKSPACE_FILE_PREVIEW_MAX_BYTES,
+                content: None,
+                unsupported_reason: Some("unreadable_file"),
+            });
+        }
+        Err(err) => {
+            return Err(ApiError::internal(format!(
+                "Failed to read workspace file '{}': {err}",
+                display_workspace_relative_path(&relative_path)
+            )));
+        }
+    };
+    let truncated = bytes.len() > WORKSPACE_FILE_PREVIEW_MAX_BYTES;
+    let preview_len = bytes.len().min(WORKSPACE_FILE_PREVIEW_MAX_BYTES);
+    let preview = &bytes[..preview_len];
+    let Ok(content) = std::str::from_utf8(preview) else {
+        return Ok(WorkspaceFileContentResponse {
+            path: display_workspace_relative_path(&relative_path),
+            kind: WorkspaceFilePreviewKind::Binary,
+            encoding: None,
+            size: metadata.len(),
+            truncated: false,
+            max_bytes: WORKSPACE_FILE_PREVIEW_MAX_BYTES,
+            content: None,
+            unsupported_reason: Some("binary_file"),
+        });
+    };
+
+    Ok(WorkspaceFileContentResponse {
+        path: display_workspace_relative_path(&relative_path),
+        kind: WorkspaceFilePreviewKind::Text,
+        encoding: Some("utf-8"),
+        size: metadata.len(),
+        truncated,
+        max_bytes: WORKSPACE_FILE_PREVIEW_MAX_BYTES,
+        content: Some(content.to_string()),
+        unsupported_reason: None,
+    })
+}
+
+fn collect_providers_response(config: &Config) -> ProvidersResponse {
+    let active_provider = config.api_provider();
+    let rows = provider_readiness_rows(config);
+    let current = rows
+        .iter()
+        .find(|row| row.provider == active_provider)
+        .map(|row| CurrentProviderResponse {
+            provider: row.provider.as_str(),
+            model: row.resolved_model.clone(),
+            base_url: row.base_url.clone(),
+            api_key_configured: row.has_key,
+        })
+        .unwrap_or_else(|| CurrentProviderResponse {
+            provider: active_provider.as_str(),
+            model: Some(config.default_model()),
+            base_url: None,
+            api_key_configured: false,
+        });
+    let providers = rows
+        .into_iter()
+        .map(|row| ProviderCatalogEntry {
+            id: row.provider.as_str(),
+            label: row.display_name,
+            supports_base_url: provider_supports_base_url(row.provider),
+            requires_api_key: !row.local,
+            api_key_configured: row.has_key,
+            default_model: row.resolved_model,
+        })
+        .collect();
+
+    ProvidersResponse { current, providers }
+}
+
+fn provider_supports_base_url(_provider: ApiProvider) -> bool {
+    true
+}
+
+fn validate_provider_test_request(
+    config: &Config,
+    request: ProviderTestRequest,
+) -> Result<ProviderTestResponse, ApiError> {
+    let provider = parse_provider_id(&request.provider)?;
+    let model = resolve_requested_provider_model(config, provider, request.model.as_deref())?;
+    let base_url_host = parse_provider_base_url_host(request.base_url.as_deref())?;
+    let api_key_configured = request
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+        || provider_readiness_rows(config)
+            .into_iter()
+            .find(|row| row.provider == provider)
+            .is_some_and(|row| row.has_key);
+
+    Ok(ProviderTestResponse {
+        ok: true,
+        provider: provider.as_str(),
+        model,
+        base_url_host,
+        api_key_configured,
+    })
+}
+
+fn apply_provider_connection_request(
+    mut config: Config,
+    request: ProviderConnectionRequest,
+) -> Result<(Config, ProviderConnectionResponse), ApiError> {
+    let persist = request.persist;
+    let provider = parse_provider_id(&request.provider)?;
+    let model = resolve_requested_provider_model(&config, provider, request.model.as_deref())?;
+    let base_url = request
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string);
+    let _base_url_host = parse_provider_base_url_host(base_url.as_deref())?;
+    let request_api_key = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string);
+
+    if persist {
+        save_provider_connection_for(
+            provider,
+            Some(model.as_str()),
+            base_url.as_deref(),
+            request_api_key.as_deref(),
+        )
+        .map_err(|err| {
+            ApiError::internal(format!("Failed to persist provider connection: {err}"))
+        })?;
+    }
+
+    config.provider = Some(provider.as_str().to_string());
+    {
+        let provider_config = config.provider_config_for_mut(provider);
+        provider_config.model = Some(model.clone());
+        if let Some(base_url) = base_url.clone() {
+            provider_config.base_url = Some(base_url);
+        }
+        if let Some(api_key) = request_api_key.clone() {
+            provider_config.api_key = Some(api_key);
+        }
+    }
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        if let Some(api_key) = request_api_key {
+            config.api_key = Some(api_key);
+        }
+        if let Some(base_url) = base_url.clone() {
+            config.base_url = Some(base_url);
+        }
+    }
+
+    let api_key_configured = provider_readiness_rows(&config)
+        .into_iter()
+        .find(|row| row.provider == provider)
+        .is_some_and(|row| row.has_key);
+    let response = ProviderConnectionResponse {
+        ok: true,
+        provider: provider.as_str(),
+        model,
+        base_url,
+        api_key_configured,
+        persisted: persist,
+    };
+
+    Ok((config, response))
+}
+
+fn parse_provider_id(raw: &str) -> Result<ApiProvider, ApiError> {
+    ApiProvider::parse(raw).ok_or_else(|| {
+        ApiError::bad_request_with_code(
+            "invalid_provider",
+            format!("Unknown provider '{}'", raw.trim()),
+        )
+    })
+}
+
+fn resolve_requested_provider_model(
+    config: &Config,
+    provider: ApiProvider,
+    requested_model: Option<&str>,
+) -> Result<String, ApiError> {
+    if let Some(model) = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        return Ok(model.to_string());
+    }
+    let model = provider_readiness_rows(config)
+        .into_iter()
+        .find(|row| row.provider == provider)
+        .and_then(|row| row.resolved_model);
+    model.ok_or_else(|| {
+        ApiError::bad_request_with_code(
+            "model_required",
+            format!("model is required for provider '{}'", provider.as_str()),
+        )
+    })
+}
+
+fn parse_provider_base_url_host(base_url: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(base_url) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = reqwest::Url::parse(base_url).map_err(|_| {
+        ApiError::bad_request_with_code("invalid_base_url", "baseUrl must be an absolute URL")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request_with_code(
+            "invalid_base_url",
+            "baseUrl must use http or https",
+        ));
+    }
+    let host = parsed.host_str().ok_or_else(|| {
+        ApiError::bad_request_with_code("invalid_base_url", "baseUrl must include a host")
+    })?;
+    Ok(Some(host.to_string()))
+}
+
+fn normalize_workspace_relative_path(path: Option<&str>) -> Result<PathBuf, ApiError> {
+    let mut normalized = PathBuf::new();
+    let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(normalized);
+    };
+    let candidate = FsPath::new(path);
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(workspace_path_escape_error(path));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn workspace_path_escape_error(path: &str) -> ApiError {
+    ApiError::bad_request_with_code(
+        "workspace_path_escape",
+        format!("Path must stay inside the active workspace: {path}"),
+    )
+}
+
+fn display_workspace_relative_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn should_hide_workspace_entry(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "target" | "node_modules" | "dist" | "build" | ".next" | ".turbo"
+    )
+}
+
+fn collect_workspace_git_metadata(workspace: &std::path::Path) -> WorkspaceGitMetadata {
+    let Some(repo_check) = run_git(workspace, &["rev-parse", "--is-inside-work-tree"]) else {
+        return WorkspaceGitMetadata::default();
+    };
+    if repo_check.trim() != "true" {
+        return WorkspaceGitMetadata::default();
+    }
+
+    WorkspaceGitMetadata {
+        branch: current_git_branch(workspace),
+        head: current_git_head(workspace),
+        dirty: run_git(workspace, &["status", "--porcelain=v1"])
+            .is_some_and(|porcelain| !porcelain.trim().is_empty()),
+    }
+}
+
+fn run_git(workspace: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = crate::dependencies::Git::output(args, workspace).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn current_git_branch(workspace: &std::path::Path) -> Option<String> {
+    let repo_check = run_git(workspace, &["rev-parse", "--is-inside-work-tree"])?;
+    if repo_check.trim() != "true" {
+        return None;
+    }
+    let branch = run_git(workspace, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return None;
+    }
+    if branch != "HEAD" {
+        return Some(branch.to_string());
+    }
+    let short_hash = run_git(workspace, &["rev-parse", "--short", "HEAD"])?;
+    let short_hash = short_hash.trim();
+    (!short_hash.is_empty()).then(|| format!("detached@{short_hash}"))
+}
+
+fn current_git_head(workspace: &std::path::Path) -> Option<String> {
+    let head = run_git(workspace, &["rev-parse", "--short", "HEAD"])?;
+    let head = head.trim();
+    (!head.is_empty()).then(|| head.to_string())
+}
+
+fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
+    // Canonicalize the workspace once so the symlink-containment check below
+    // compares like-for-like. If the workspace can't be canonicalized at all
+    // (e.g. it doesn't exist on disk yet) fall back to the configured global
+    // skills dir rather than risk constructing paths from a non-existent root.
+    let canonical_workspace = match fs::canonicalize(workspace) {
+        Ok(path) => path,
+        Err(_) => return config.skills_dir(),
+    };
+    for candidate in [
+        canonical_workspace.join(".agents").join("skills"),
+        canonical_workspace.join("skills"),
+    ] {
+        // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
+        // `/etc` cannot promote arbitrary filesystem locations into the
+        // skills directory. The candidate must still resolve under the
+        // canonicalized workspace root after symlink expansion.
+        if let Ok(canon) = fs::canonicalize(&candidate)
+            && canon.starts_with(&canonical_workspace)
+            && canon.is_dir()
+        {
+            return canon;
+        }
+    }
+    config.skills_dir()
+}
+
+fn skills_search_directories(workspace: &FsPath, skills_dir: &FsPath) -> Vec<PathBuf> {
+    let mut directories = crate::skills::skills_directories(workspace);
+    if skills_dir.is_dir() && !directories.iter().any(|path| path == skills_dir) {
+        directories.push(skills_dir.to_path_buf());
+    }
+    directories
+}
+
+fn discover_skills_for_runtime_api(
+    workspace: &FsPath,
+    skills_dir: &FsPath,
+) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
+    let directories = skills_search_directories(workspace, skills_dir);
+    let registry = crate::skills::discover_from_directories(directories.clone());
+    (registry, directories)
+}
+
+fn skill_entry_is_bundled(skill: &crate::skills::Skill, skills_dir: &FsPath) -> bool {
+    if !crate::skills::is_bundled_skill_name(&skill.name) {
+        return false;
+    }
+
+    let expected_path = skills_dir.join(&skill.name).join("SKILL.md");
+    paths_refer_to_same_file(&skill.path, &expected_path)
+}
+
+fn paths_refer_to_same_file(left: &FsPath, right: &FsPath) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn format_skill_search_paths(directories: &[PathBuf]) -> String {
+    if directories.is_empty() {
+        return "<none>".to_string();
+    }
+    directories
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageQuery {
+    /// ISO-8601 lower bound (inclusive). When omitted, no lower bound.
+    since: Option<String>,
+    /// ISO-8601 upper bound (inclusive). When omitted, no upper bound.
+    until: Option<String>,
+    /// Bucket key. One of `day` (default), `model`, `provider`, `thread`.
+    group_by: Option<String>,
+}
+
+fn parse_iso8601(raw: &str, field: &str) -> Result<chrono::DateTime<Utc>, ApiError> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| ApiError::bad_request(format!("Invalid {field} (expected RFC 3339): {e}")))
+}
+
+async fn get_usage(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let since = match query.since.as_deref() {
+        Some(raw) => Some(parse_iso8601(raw, "since")?),
+        None => None,
+    };
+    let until = match query.until.as_deref() {
+        Some(raw) => Some(parse_iso8601(raw, "until")?),
+        None => None,
+    };
+    if let (Some(s), Some(u)) = (since, until)
+        && s > u
+    {
+        return Err(ApiError::bad_request("since must be <= until".to_string()));
+    }
+    let group_by = match query.group_by.as_deref().unwrap_or("day") {
+        "day" => UsageGroupBy::Day,
+        "model" => UsageGroupBy::Model,
+        "provider" => UsageGroupBy::Provider,
+        "thread" => UsageGroupBy::Thread,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "Unsupported group_by '{other}': expected one of day, model, provider, thread"
+            )));
+        }
+    };
+
+    let aggregation = state
+        .runtime_threads
+        .aggregate_usage(since, until, group_by)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(json!(aggregation)))
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotsQuery {
+    /// Maximum number of snapshots to return. Mirrors `/restore list [N]`.
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotEntry {
+    id: String,
+    label: String,
+    timestamp: i64,
+}
+
+async fn list_snapshots(
+    State(state): State<RuntimeApiState>,
+    Query(query): Query<SnapshotsQuery>,
+) -> Result<Json<Vec<SnapshotEntry>>, ApiError> {
+    Ok(Json(snapshot_entries_for_workspace(
+        &state.workspace,
+        query,
+    )?))
+}
+
+async fn restore_snapshot(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    restore_snapshot_for_workspace(&state.workspace, &id)?;
+    Ok(Json(json!({
+        "restored": id,
+    })))
+}
+
+fn restore_snapshot_for_workspace(workspace: &FsPath, id: &str) -> Result<(), ApiError> {
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo init failed: {e}")))?;
+    let snapshot_id = crate::snapshot::SnapshotId(id.to_string());
+    repo.restore(&snapshot_id)
+        .map_err(|e| ApiError::internal(format!("Snapshot restore failed: {e}")))
+}
+
+fn snapshot_entries_for_workspace(
+    workspace: &FsPath,
+    query: SnapshotsQuery,
+) -> Result<Vec<SnapshotEntry>, ApiError> {
+    const DEFAULT_LIMIT: usize = 20;
+    const MAX_LIMIT: usize = 100;
+
+    let limit = match query.limit.unwrap_or(DEFAULT_LIMIT) {
+        1..=MAX_LIMIT => query.limit.unwrap_or(DEFAULT_LIMIT),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "limit must be between 1 and {MAX_LIMIT}; got {other}",
+            )));
+        }
+    };
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace)
+        .map_err(|e| ApiError::internal(format!("Snapshot repo unavailable: {e}")))?;
+    let snapshots = repo
+        .list(limit)
+        .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
+    Ok(snapshots
+        .into_iter()
+        .map(|snapshot| SnapshotEntry {
+            id: snapshot.id.as_str().to_string(),
+            label: snapshot.label,
+            timestamp: snapshot.timestamp,
+        })
+        .collect())
+}
+
+const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
+
+/// Built-in dev origins always allowed by the runtime API (whalescale#255).
+const DEFAULT_CORS_ORIGINS: &[&str] = &[
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "tauri://localhost",
+];
+
+fn cors_layer(extra_origins: &[String]) -> CorsLayer {
+    let mut origins: Vec<HeaderValue> = DEFAULT_CORS_ORIGINS
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    for raw in extra_origins {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match HeaderValue::from_str(trimmed) {
+            Ok(value) if !origins.contains(&value) => origins.push(value),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(
+                "Ignoring invalid CORS origin '{trimmed}': {err}; expected scheme://host[:port]"
+            ),
+        }
+    }
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+}
+
+fn map_task_err(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("not found") {
+        ApiError::not_found(message)
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
+fn map_automation_err(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("Failed to read automation")
+        || message.contains("No such file or directory")
+    {
+        ApiError::not_found(message)
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
+fn map_thread_err(err: anyhow::Error) -> ApiError {
+    let message = err.to_string();
+    if message.contains("not found") {
+        ApiError::not_found(message)
+    } else if message.contains("already has an active turn")
+        || message.contains("No active turn")
+        || message.contains("is not active")
+    {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message,
+        }
+    } else {
+        ApiError::bad_request(message)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request",
+            message: message.into(),
+        }
+    }
+
+    fn bad_request_with_code(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "error": {
+                    "code": self.code,
+                    "message": self.message,
+                    "status": self.status.as_u16(),
+                }
+            })),
+        )
+            .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::events::{Event as EngineEvent, TurnOutcomeStatus};
+    use crate::core::ops::Op;
+    use crate::models::Usage;
+    use crate::runtime_threads::RuntimeEventRecord;
+    use crate::test_support::{EnvVarGuard, lock_test_env};
+    use anyhow::{Context, bail};
+    use futures_util::StreamExt;
+    use std::fs;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    use tokio::time::sleep;
+    use uuid::Uuid;
+
+    struct MockExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::task_manager::TaskExecutor for MockExecutor {
+        async fn execute(
+            &self,
+            _task: crate::task_manager::ExecutionTask,
+            events: mpsc::UnboundedSender<crate::task_manager::TaskExecutionEvent>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> crate::task_manager::TaskExecutionResult {
+            let _ = events.send(crate::task_manager::TaskExecutionEvent::Status {
+                message: "started".to_string(),
+            });
+            sleep(Duration::from_millis(100)).await;
+            if cancel.is_cancelled() {
+                return crate::task_manager::TaskExecutionResult {
+                    status: crate::task_manager::TaskStatus::Canceled,
+                    result_text: None,
+                    error: None,
+                };
+            }
+            crate::task_manager::TaskExecutionResult {
+                status: crate::task_manager::TaskStatus::Completed,
+                result_text: Some("ok".to_string()),
+                error: None,
+            }
+        }
+    }
+
+    fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedSession {
+        SavedSession {
+            schema_version: 1,
+            metadata: SessionMetadata {
+                id: "session-1".to_string(),
+                title: "test session".to_string(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                message_count: 1,
+                total_tokens: 0,
+                model: "test-model".to_string(),
+                workspace: PathBuf::from("."),
+                mode: None,
+                cost: Default::default(),
+                parent_session_id: None,
+                forked_from_message_count: None,
+                cumulative_turn_secs: 0,
+            },
+            messages: vec![crate::models::Message {
+                role: "assistant".to_string(),
+                content: blocks,
+            }],
+            system_prompt: None,
+            context_references: Vec::new(),
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn run_test_git(workspace: &std::path::Path, args: &[&str]) -> Result<()> {
+        let output = crate::dependencies::Git::output(args, workspace)
+            .with_context(|| format!("git {args:?} failed to spawn"))?;
+        if !output.status.success() {
+            bail!(
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_status_reports_head_and_dirty_counts() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo)?;
+        run_test_git(&repo, &["init", "-b", "main"])?;
+        run_test_git(&repo, &["config", "core.autocrlf", "false"])?;
+        fs::write(repo.join("tracked.txt"), "clean\n")?;
+        run_test_git(&repo, &["add", "tracked.txt"])?;
+        run_test_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=CodeWhale Test",
+                "-c",
+                "user.email=codewhale@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )?;
+
+        let clean = collect_workspace_status(&repo);
+        assert!(clean.git_repo);
+        assert_eq!(clean.branch.as_deref(), Some("main"));
+        assert!(clean.head.as_deref().is_some_and(|head| !head.is_empty()));
+        assert!(!clean.dirty);
+
+        fs::write(repo.join("tracked.txt"), "dirty\n")?;
+        fs::write(repo.join("untracked.txt"), "new\n")?;
+
+        let dirty = collect_workspace_status(&repo);
+        assert!(dirty.dirty);
+        assert_eq!(dirty.unstaged, 1);
+        assert_eq!(dirty.untracked, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_files_endpoint_returns_immediate_directory_entries() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("src").join("components"))?;
+        fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n")?;
+        fs::write(workspace.join("src").join("lib.rs"), "pub fn lib() {}\n")?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!("http://{addr}/v1/workspace/files?path=src"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["path"].as_str(), Some("src"));
+        let entries = resp["entries"].as_array().context("entries array")?;
+        let names: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["components", "lib.rs", "main.rs"]);
+        assert_eq!(entries[0]["kind"].as_str(), Some("directory"));
+        assert_eq!(entries[1]["kind"].as_str(), Some("file"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_file_content_endpoint_returns_text_preview_json() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::write(workspace.join("src").join("main.rs"), "fn main() {}\n")?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/workspace/files/content?path=src/main.rs"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["path"].as_str(), Some("src/main.rs"));
+        assert_eq!(resp["kind"].as_str(), Some("text"));
+        assert_eq!(resp["encoding"].as_str(), Some("utf-8"));
+        assert_eq!(resp["truncated"].as_bool(), Some(false));
+        assert_eq!(resp["maxBytes"].as_u64(), Some(204_800));
+        assert_eq!(resp["content"].as_str(), Some("fn main() {}\n"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_file_content_endpoint_marks_binary_files_without_raw_content() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("assets"))?;
+        fs::write(
+            workspace.join("assets").join("blob.bin"),
+            [0_u8, 159, 146, 150, 0],
+        )?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/workspace/files/content?path=assets/blob.bin"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["path"].as_str(), Some("assets/blob.bin"));
+        assert_eq!(resp["kind"].as_str(), Some("binary"));
+        assert_eq!(resp["content"], Value::Null);
+        assert_eq!(resp["unsupportedReason"].as_str(), Some("binary_file"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_files_endpoint_hides_heavy_directories_by_default() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::create_dir_all(workspace.join("target"))?;
+        fs::create_dir_all(workspace.join("node_modules"))?;
+        fs::create_dir_all(workspace.join(".git"))?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!("http://{addr}/v1/workspace/files"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let names: Vec<_> = resp["entries"]
+            .as_array()
+            .context("entries array")?
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["src"]);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_file_content_endpoint_truncates_large_text_preview() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("logs"))?;
+        let large_text = "a".repeat(WORKSPACE_FILE_PREVIEW_MAX_BYTES + 10);
+        fs::write(workspace.join("logs").join("app.log"), large_text)?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/workspace/files/content?path=logs/app.log"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["kind"].as_str(), Some("text"));
+        assert_eq!(resp["truncated"].as_bool(), Some(true));
+        assert_eq!(resp["maxBytes"].as_u64(), Some(204_800));
+        assert_eq!(
+            resp["content"].as_str().context("content")?.len(),
+            WORKSPACE_FILE_PREVIEW_MAX_BYTES
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_file_content_endpoint_marks_unreadable_files_without_content() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(workspace.join("private"))?;
+        let secret_path = workspace.join("private").join("secret.txt");
+        fs::write(&secret_path, "secret\n")?;
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o000))?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/workspace/files/content?path=private/secret.txt"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["path"].as_str(), Some("private/secret.txt"));
+        assert_eq!(resp["kind"].as_str(), Some("unreadable"));
+        assert_eq!(resp["content"], Value::Null);
+        assert_eq!(resp["unsupportedReason"].as_str(), Some("unreadable_file"));
+
+        fs::set_permissions(&secret_path, fs::Permissions::from_mode(0o600))?;
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_files_endpoint_rejects_workspace_escape_with_error_code() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime-root");
+        let sessions_dir = root.join("sessions");
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root,
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .get(format!("http://{addr}/v1/workspace/files?path=../secret"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(
+            body["error"]["code"].as_str(),
+            Some("workspace_path_escape")
+        );
+        assert_eq!(body["error"]["status"].as_u64(), Some(400));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn providers_endpoint_returns_catalog_without_secret_material() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp: serde_json::Value = client
+            .get(format!("http://{addr}/v1/providers"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["current"]["provider"].as_str(), Some("deepseek"));
+        assert!(resp["current"]["model"].as_str().is_some());
+        assert!(resp["current"]["apiKeyConfigured"].is_boolean());
+        assert!(resp["current"].get("apiKey").is_none());
+
+        let providers = resp["providers"].as_array().context("providers array")?;
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider["id"].as_str() == Some("openai")
+                    && provider["label"].as_str() == Some("OpenAI-compatible")
+                    && provider["requiresApiKey"].as_bool() == Some(true))
+        );
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider["id"].as_str() == Some("ollama")
+                    && provider["requiresApiKey"].as_bool() == Some(false))
+        );
+        assert!(!resp.to_string().contains("apiKey\":\""));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_endpoint_validates_without_echoing_or_applying_key() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let secret = "sk-test-secret-should-not-leak";
+
+        let resp: serde_json::Value = client
+            .post(format!("http://{addr}/v1/providers/test"))
+            .json(&serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-test-model",
+                "baseUrl": "https://api.openai.com/v1",
+                "apiKey": secret
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["ok"].as_bool(), Some(true));
+        assert_eq!(resp["provider"].as_str(), Some("openai"));
+        assert_eq!(resp["model"].as_str(), Some("gpt-test-model"));
+        assert_eq!(resp["baseUrlHost"].as_str(), Some("api.openai.com"));
+        assert_eq!(resp["apiKeyConfigured"].as_bool(), Some(true));
+        assert!(resp.get("apiKey").is_none());
+        assert!(!resp.to_string().contains(secret));
+
+        let providers: serde_json::Value = client
+            .get(format!("http://{addr}/v1/providers"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(providers["current"]["provider"].as_str(), Some("deepseek"));
+        assert!(!providers.to_string().contains(secret));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_test_endpoint_redacts_secret_on_validation_errors() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let secret = "sk-test-secret-should-not-leak";
+
+        let resp = client
+            .post(format!("http://{addr}/v1/providers/test"))
+            .json(&serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-test-model",
+                "baseUrl": "not-a-url",
+                "apiKey": secret
+            }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["error"]["code"].as_str(), Some("invalid_base_url"));
+        assert!(!body.to_string().contains(secret));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_connection_endpoint_applies_runtime_config_without_echoing_key() -> Result<()>
+    {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let secret = "sk-test-secret-should-not-leak";
+
+        let resp: serde_json::Value = client
+            .post(format!("http://{addr}/v1/providers/connection"))
+            .json(&serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-test-model",
+                "baseUrl": "https://api.openai.com/v1",
+                "apiKey": secret,
+                "persist": false
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["ok"].as_bool(), Some(true));
+        assert_eq!(resp["provider"].as_str(), Some("openai"));
+        assert_eq!(resp["model"].as_str(), Some("gpt-test-model"));
+        assert_eq!(resp["baseUrl"].as_str(), Some("https://api.openai.com/v1"));
+        assert_eq!(resp["apiKeyConfigured"].as_bool(), Some(true));
+        assert_eq!(resp["persisted"].as_bool(), Some(false));
+        assert!(!resp.to_string().contains(secret));
+
+        let providers: serde_json::Value = client
+            .get(format!("http://{addr}/v1/providers"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(providers["current"]["provider"].as_str(), Some("openai"));
+        assert_eq!(
+            providers["current"]["model"].as_str(),
+            Some("gpt-test-model")
+        );
+        assert_eq!(
+            providers["current"]["baseUrl"].as_str(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            providers["current"]["apiKeyConfigured"].as_bool(),
+            Some(true)
+        );
+        assert!(!providers.to_string().contains(secret));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_connection_request_persist_true_writes_local_config_without_echoing_key()
+    -> Result<()> {
+        let _lock = lock_test_env();
+        let tmp = tempfile::tempdir()?;
+        let config_path = tmp.path().join("codewhale").join("config.toml");
+        let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path.as_os_str());
+        let _secret_backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "local");
+        let secret = "sk-test-secret-should-not-leak";
+
+        let (_config, response) = apply_provider_connection_request(
+            Config::default(),
+            ProviderConnectionRequest {
+                provider: "openai".to_string(),
+                model: Some("gpt-test-model".to_string()),
+                base_url: Some("https://api.openai.com/v1".to_string()),
+                api_key: Some(secret.to_string()),
+                persist: true,
+            },
+        )
+        .map_err(|err| anyhow!(err.message))?;
+
+        assert!(response.ok);
+        assert_eq!(response.provider, "openai");
+        assert_eq!(response.model, "gpt-test-model");
+        assert_eq!(
+            response.base_url.as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+        assert!(response.api_key_configured);
+        assert!(response.persisted);
+        assert!(!serde_json::to_string(&response)?.contains(secret));
+
+        let contents = fs::read_to_string(&config_path)?;
+        let parsed: toml::Value = toml::from_str(&contents)?;
+        assert_eq!(
+            parsed.get("provider").and_then(toml::Value::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            parsed
+                .get("providers")
+                .and_then(|providers| providers.get("openai"))
+                .and_then(|entry| entry.get("model"))
+                .and_then(toml::Value::as_str),
+            Some("gpt-test-model")
+        );
+        assert_eq!(
+            parsed
+                .get("providers")
+                .and_then(|providers| providers.get("openai"))
+                .and_then(|entry| entry.get("base_url"))
+                .and_then(toml::Value::as_str),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(
+            parsed
+                .get("providers")
+                .and_then(|providers| providers.get("openai"))
+                .and_then(|entry| entry.get("api_key"))
+                .and_then(toml::Value::as_str),
+            Some(secret)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teaching_events_endpoint_returns_runtime_thread_history() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let resp: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/teaching-events?limit=10"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(resp["threadId"].as_str(), Some(thread_id));
+        let events = resp["events"].as_array().context("teaching events")?;
+        assert!(!events.is_empty());
+        assert_eq!(events[0]["type"].as_str(), Some("session-started"));
+        assert_eq!(events[0]["category"].as_str(), Some("Context"));
+        assert_eq!(events[0]["actor"].as_str(), Some("system"));
+        assert!(events[0]["seq"].as_u64().is_some());
+        assert_eq!(
+            resp["latestSeq"].as_u64(),
+            events.last().and_then(|event| event["seq"].as_u64())
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn teaching_events_stream_replays_backlog_as_sse() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let resp = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/teaching-events/stream?limit=10"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        let frame = read_first_sse_frame(resp).await?;
+        let (event_name, payload) = parse_sse_frame(&frame)?;
+
+        assert_eq!(event_name, "teaching.event");
+        assert_eq!(payload["sessionId"].as_str(), Some(thread_id));
+        assert_eq!(payload["type"].as_str(), Some("session-started"));
+        assert_eq!(payload["category"].as_str(), Some("Context"));
+        assert!(payload["seq"].as_u64().is_some());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn teaching_event_mapper_redacts_secret_material() {
+        let event = crate::runtime_threads::RuntimeEventRecord {
+            schema_version: 1,
+            seq: 42,
+            timestamp: Utc::now(),
+            thread_id: "thr_secret".to_string(),
+            turn_id: Some("turn_secret".to_string()),
+            item_id: None,
+            event: "approval.required".to_string(),
+            payload: json!({
+                "id": "approval-1",
+                "tool_name": "write_file",
+                "description": "write DEEPSEEK_API_KEY=sk-secret",
+                "input": { "content": "DEEPSEEK_API_KEY=sk-secret" }
+            }),
+        };
+
+        let teaching = teaching_event_from_runtime_event(event).expect("teaching event");
+        let serialized = serde_json::to_string(&teaching).expect("serialize teaching event");
+        assert_eq!(teaching.event_type, EducationEventType::ApprovalRequested);
+        assert_eq!(teaching.category, "Safety");
+        assert!(teaching.summary.contains("[REDACTED]"));
+        assert!(!serialized.contains("sk-secret"));
+    }
+
+    #[test]
+    fn runtime_event_payload_redacts_secret_material() {
+        let event = crate::runtime_threads::RuntimeEventRecord {
+            schema_version: 1,
+            seq: 43,
+            timestamp: Utc::now(),
+            thread_id: "thr_secret".to_string(),
+            turn_id: Some("turn_secret".to_string()),
+            item_id: Some("item_secret".to_string()),
+            event: "item.failed".to_string(),
+            payload: json!({
+                "item": {
+                    "id": "item_secret",
+                    "kind": "error",
+                    "summary": "api key: ****61b0 rejected",
+                    "detail": "DEEPSEEK_API_KEY=sk-secret"
+                }
+            }),
+        };
+
+        let payload = runtime_event_payload(event);
+        let serialized = serde_json::to_string(&payload).expect("serialize runtime event");
+        assert!(serialized.contains("[REDACTED]"));
+        assert!(!serialized.contains("****61b0"));
+        assert!(!serialized.contains("sk-secret"));
+    }
+
+    #[test]
+    fn session_detail_tool_use_preserves_caller_metadata() {
+        let detail = session_to_detail(saved_session_with_blocks(vec![
+            crate::models::ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "task_shell_start".to_string(),
+                input: json!({ "cmd": "cargo test" }),
+                caller: Some(crate::models::ToolCaller {
+                    caller_type: "subagent".to_string(),
+                    tool_id: Some("parent-tool".to_string()),
+                }),
+            },
+        ]));
+
+        let block = &detail.messages[0]["content"][0];
+        assert_eq!(block["type"].as_str(), Some("tool_use"));
+        assert_eq!(block["caller"]["type"].as_str(), Some("subagent"));
+        assert_eq!(block["caller"]["tool_id"].as_str(), Some("parent-tool"));
+    }
+
+    #[test]
+    fn session_detail_tool_result_keeps_fallback_content_with_blocks() {
+        let detail = session_to_detail(saved_session_with_blocks(vec![
+            crate::models::ContentBlock::ToolResult {
+                tool_use_id: "tool-1".to_string(),
+                content: "fallback text".to_string(),
+                is_error: Some(false),
+                content_blocks: Some(vec![json!({
+                    "type": "text",
+                    "text": "structured text"
+                })]),
+            },
+        ]));
+
+        let block = &detail.messages[0]["content"][0];
+        assert_eq!(block["type"].as_str(), Some("tool_result"));
+        assert_eq!(block["content"].as_str(), Some("fallback text"));
+        assert_eq!(
+            block["content_blocks"][0]["text"].as_str(),
+            Some("structured text")
+        );
+        assert_eq!(block["is_error"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn runtime_auth_generates_token_by_default() {
+        let auth = resolve_runtime_auth(None, None, false);
+        assert!(auth.generated);
+        let token = auth.token.expect("generated token");
+        assert!(token.starts_with("cwrt_"));
+        assert!(token.len() > 32);
+    }
+
+    #[test]
+    fn runtime_auth_requires_explicit_insecure_for_no_token() {
+        let auth = resolve_runtime_auth(None, None, true);
+        assert_eq!(
+            auth,
+            ResolvedRuntimeAuth {
+                token: None,
+                generated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_auth_prefers_cli_token_over_env_token() {
+        let auth = resolve_runtime_auth(
+            Some(" cli-token ".to_string()),
+            Some("env-token".to_string()),
+            false,
+        );
+        assert_eq!(
+            auth,
+            ResolvedRuntimeAuth {
+                token: Some("cli-token".to_string()),
+                generated: false,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_auth_ignores_blank_configured_tokens() {
+        let auth = resolve_runtime_auth(Some(" ".to_string()), Some("\t".to_string()), false);
+        assert!(auth.generated);
+        assert!(auth.token.is_some());
+    }
+
+    #[test]
+    fn url_query_component_percent_encodes_token() {
+        assert_eq!(
+            url_query_component("abc ABC+/?:=&%"),
+            "abc%20ABC%2B%2F%3F%3A%3D%26%25"
+        );
+    }
+
+    #[test]
+    fn token_from_query_decodes_percent_encoded_token() {
+        assert_eq!(
+            token_from_query(Some("since_seq=0&token=abc%20ABC%2B%2F%3F%3A%3D%26%25")),
+            Some("abc ABC+/?:=&%".to_string())
+        );
+        assert_eq!(token_from_query(Some("token=bad%ZZ")), None);
+    }
+
+    async fn spawn_test_server_with_root(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        spawn_test_server_with_root_and_token(root, sessions_dir, None).await
+    }
+
+    async fn spawn_test_server_with_root_and_token(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        spawn_test_server_with_root_token_and_mobile(root, sessions_dir, runtime_token, false).await
+    }
+
+    async fn spawn_test_server_with_root_token_and_mobile(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+        mobile_enabled: bool,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        spawn_test_server_with_root_token_mobile_workspace(
+            root,
+            sessions_dir,
+            runtime_token,
+            mobile_enabled,
+            PathBuf::from("."),
+        )
+        .await
+    }
+
+    async fn spawn_test_server_with_root_token_mobile_workspace(
+        root: PathBuf,
+        sessions_dir: PathBuf,
+        runtime_token: Option<String>,
+        mobile_enabled: bool,
+        workspace: PathBuf,
+    ) -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        fs::create_dir_all(&sessions_dir)?;
+        fs::create_dir_all(&workspace)?;
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                data_dir: root.join("tasks"),
+                worker_count: 1,
+                default_workspace: workspace.clone(),
+                default_model: DEFAULT_TEXT_MODEL.to_string(),
+                default_mode: "agent".to_string(),
+                allow_shell: false,
+                trust_mode: false,
+                max_subagents: 2,
+            },
+            Arc::new(MockExecutor),
+        )
+        .await?;
+        let runtime_threads: SharedRuntimeThreadManager = Arc::new(RuntimeThreadManager::open(
+            Config::default(),
+            workspace.clone(),
+            RuntimeThreadManagerConfig::from_task_data_dir(root.join("runtime")),
+        )?);
+        runtime_threads.attach_task_manager(manager.clone());
+        let automations = Arc::new(Mutex::new(AutomationManager::open(
+            root.join("automations"),
+        )?));
+        runtime_threads.attach_automation_manager(automations.clone());
+
+        let auth_required = runtime_token.is_some();
+        let state = RuntimeApiState {
+            config: Config::default(),
+            workspace,
+            task_manager: manager,
+            runtime_threads: runtime_threads.clone(),
+            cors_origins: Vec::new(),
+            sessions_dir,
+            mcp_config_path: root.join("mcp.json"),
+            automations,
+            runtime_token,
+            skill_state: Arc::new(Mutex::new(
+                SkillStateStore::load_from(root.join("skills_state.toml")).unwrap_or_default(),
+            )),
+            auth_required,
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 0,
+            mobile_enabled,
+        };
+        let app = build_router(state);
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Some((addr, runtime_threads, handle)))
+    }
+
+    async fn spawn_test_server() -> Result<
+        Option<(
+            SocketAddr,
+            SharedRuntimeThreadManager,
+            tokio::task::JoinHandle<()>,
+        )>,
+    > {
+        let root = std::env::temp_dir().join(format!("deepseek-runtime-api-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        spawn_test_server_with_root(root, sessions_dir).await
+    }
+
+    async fn read_first_sse_frame(resp: reqwest::Response) -> Result<String> {
+        let mut stream = resp.bytes_stream();
+        let mut buf = Vec::new();
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .context("timed out waiting for SSE frame")?
+                .context("SSE stream ended unexpectedly")??;
+            buf.extend_from_slice(&next);
+
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(idx) = text.find("\n\n").or_else(|| text.find("\r\n\r\n")) {
+                return Ok(text[..idx].to_string());
+            }
+
+            if buf.len() > 64 * 1024 {
+                bail!("SSE frame exceeded 64KB without delimiter");
+            }
+        }
+    }
+
+    fn parse_sse_frame(frame: &str) -> Result<(String, serde_json::Value)> {
+        let mut event_name: Option<String> = None;
+        let mut data_lines = Vec::new();
+        for line in frame.lines() {
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start().to_string());
+            }
+        }
+        let event_name = event_name.context("missing SSE event field")?;
+        let payload = if data_lines.is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&data_lines.join("\n"))
+                .with_context(|| format!("invalid SSE data payload: {}", data_lines.join("\n")))?
+        };
+        Ok((event_name, payload))
+    }
+
+    async fn wait_for_terminal_turn_status(
+        client: &reqwest::Client,
+        addr: SocketAddr,
+        thread_id: &str,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> Result<String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let detail: serde_json::Value = client
+                .get(format!("http://{addr}/v1/threads/{thread_id}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            let status = detail["turns"]
+                .as_array()
+                .and_then(|turns| turns.iter().find(|turn| turn["id"] == turn_id))
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if matches!(
+                status.as_str(),
+                "completed" | "failed" | "interrupted" | "canceled"
+            ) {
+                return Ok(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("timed out waiting for terminal turn status for {turn_id}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_in_progress_item(
+        client: &reqwest::Client,
+        addr: SocketAddr,
+        thread_id: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let detail: serde_json::Value = client
+                .get(format!("http://{addr}/v1/threads/{thread_id}"))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            if detail["items"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["status"] == "in_progress"))
+            {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!("timed out waiting for in-progress item in thread {thread_id}");
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn health_and_tasks_endpoints_work() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let health: serde_json::Value = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["service"], "codewhale-runtime-api");
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/tasks"))
+            .json(&json!({ "prompt": "hello task" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let id = created["id"].as_str().expect("task id").to_string();
+
+        let listed: serde_json::Value = client
+            .get(format!("http://{addr}/v1/tasks"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            listed["tasks"]
+                .as_array()
+                .is_some_and(|tasks| !tasks.is_empty())
+        );
+
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/tasks/{id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["id"], id);
+
+        let _cancelled: serde_json::Value = client
+            .post(format!("http://{addr}/v1/tasks/{id}/cancel"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_token_guard_protects_v1_routes() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-runtime-api-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let token = "local-test-token".to_string();
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_and_token(root, sessions_dir, Some(token.clone())).await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let health = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(health.status(), StatusCode::OK);
+
+        let unauthorized = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .send()
+            .await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let bearer = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(bearer.status(), StatusCode::OK);
+
+        let query_token = client
+            .get(format!("http://{addr}/v1/threads/summary?token={token}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(query_token.status(), StatusCode::OK);
+
+        let codewhale_header = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .header("x-codewhale-runtime-token", &token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(codewhale_header.status(), StatusCode::OK);
+
+        let deepseek_header = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .header("x-deepseek-runtime-token", &token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(deepseek_header.status(), StatusCode::OK);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_summary_includes_workspace_branch_metadata() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("runtime");
+        let sessions_dir = root.join("sessions");
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo)?;
+        run_test_git(&repo, &["init", "-b", "feature/agent"])?;
+        run_test_git(&repo, &["config", "core.autocrlf", "false"])?;
+        fs::write(repo.join("README.md"), "branch visibility\n")?;
+        run_test_git(&repo, &["add", "README.md"])?;
+        run_test_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=CodeWhale Test",
+                "-c",
+                "user.email=codewhale@example.invalid",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )?;
+
+        let non_git = tmp.path().join("non-git");
+        fs::create_dir_all(&non_git)?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root(root, sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let git_thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "title": "Git workspace",
+                "workspace": repo,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let git_thread_id = git_thread["id"]
+            .as_str()
+            .context("missing git thread id")?
+            .to_string();
+        fs::write(
+            repo.join("dirty.txt"),
+            "worktree changed after thread spawn\n",
+        )?;
+
+        let plain_thread: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "title": "Plain workspace",
+                "workspace": non_git,
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let plain_thread_id = plain_thread["id"]
+            .as_str()
+            .context("missing plain thread id")?
+            .to_string();
+
+        let summary: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/summary?limit=100"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let summaries = summary.as_array().context("summary should be an array")?;
+        let git_summary = summaries
+            .iter()
+            .find(|item| item["id"] == git_thread_id)
+            .context("missing git workspace summary")?;
+        assert_eq!(git_summary["branch"], "feature/agent");
+        assert!(
+            git_summary["head"]
+                .as_str()
+                .is_some_and(|head| !head.is_empty())
+        );
+        assert_eq!(git_summary["dirty"], true);
+        assert_eq!(git_summary["workspace"], repo.to_string_lossy().as_ref());
+
+        let plain_summary = summaries
+            .iter()
+            .find(|item| item["id"] == plain_thread_id)
+            .context("missing plain workspace summary")?;
+        assert_eq!(plain_summary["branch"], serde_json::Value::Null);
+        assert_eq!(plain_summary["head"], serde_json::Value::Null);
+        assert_eq!(plain_summary["dirty"], false);
+        assert_eq!(
+            plain_summary["workspace"],
+            non_git.to_string_lossy().as_ref()
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_and_automation_endpoints_work() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let workspace: serde_json::Value = client
+            .get(format!("http://{addr}/v1/workspace/status"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(workspace.get("workspace").is_some());
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/automations"))
+            .json(&json!({
+                "name": "Smoke automation",
+                "prompt": "automation smoke test",
+                "rrule": "FREQ=HOURLY;INTERVAL=2",
+                "status": "active"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let automation_id = created["id"]
+            .as_str()
+            .context("missing automation id")?
+            .to_string();
+
+        let listed: serde_json::Value = client
+            .get(format!("http://{addr}/v1/automations"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            listed
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == automation_id))
+        );
+
+        let run_now: serde_json::Value = client
+            .post(format!("http://{addr}/v1/automations/{automation_id}/run"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(run_now["automation_id"], automation_id);
+
+        let paused: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/automations/{automation_id}/pause"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(paused["status"], "paused");
+
+        let resumed: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/automations/{automation_id}/resume"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(resumed["status"], "active");
+
+        let updated: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/automations/{automation_id}"))
+            .json(&json!({
+                "name": "Smoke automation edited",
+                "rrule": "FREQ=WEEKLY;BYDAY=MO,WE;BYHOUR=10;BYMINUTE=15"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(updated["name"], "Smoke automation edited");
+
+        let runs: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/automations/{automation_id}/runs?limit=5"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            runs.as_array().is_some_and(|items| !items.is_empty()),
+            "expected at least one run entry"
+        );
+
+        let _deleted: serde_json::Value = client
+            .delete(format!("http://{addr}/v1/automations/{automation_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        let missing_status = client
+            .get(format!("http://{addr}/v1/automations/{automation_id}"))
+            .send()
+            .await?
+            .status();
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fleet_status_runtime_api_exposes_state_and_actions() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("codewhale-fleet-api-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        let manager = FleetManager::open(&workspace)?;
+        let task = codewhale_protocol::fleet::FleetTaskSpec {
+            id: "task-a".to_string(),
+            name: "Task A".to_string(),
+            description: None,
+            objective: Some("Inspect fleet status through Runtime API".to_string()),
+            instructions: "Stay running for inspection.".to_string(),
+            worker: Some(codewhale_protocol::fleet::FleetTaskWorkerProfile {
+                role: Some("status-reviewer".to_string()),
+                tool_profile: Some("read-only".to_string()),
+                tools: vec!["rg".to_string()],
+                capabilities: vec!["fleet".to_string()],
+            }),
+            workspace: None,
+            input_files: Vec::new(),
+            context: Vec::new(),
+            budget: None,
+            tags: Vec::new(),
+            expected_artifacts: vec![FleetArtifactKind::Log],
+            scorer: None,
+            retry_policy: None,
+            alert_policy: None,
+            timeout_seconds: None,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let report = manager.create_run(
+            crate::fleet::task_spec::FleetTaskSpecDocument {
+                name: Some("api smoke".to_string()),
+                labels: std::collections::BTreeMap::new(),
+                security_policy: None,
+                workers: Vec::new(),
+                tasks: vec![task],
+            },
+            1,
+        )?;
+        let worker_id = report.worker_ids[0].clone();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root.clone(),
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let runs: serde_json::Value = client
+            .get(format!("http://{addr}/v1/fleet/runs"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(runs["status"]["running"], 1);
+        assert_eq!(runs["runs"][0]["id"], report.run_id.0);
+
+        let worker: serde_json::Value = client
+            .get(format!("http://{addr}/v1/fleet/workers/{worker_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(
+            worker["objective"],
+            "Inspect fleet status through Runtime API"
+        );
+        assert_eq!(worker["role"], "status-reviewer");
+        assert_eq!(worker["host"], "local");
+        assert_eq!(worker["artifacts"][0]["kind"], "log");
+
+        let interrupted: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/workers/{worker_id}/interrupt"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(interrupted["action"], "interrupt");
+        assert_eq!(interrupted["worker"]["last_error"], "cancelled by operator");
+
+        let restarted: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/workers/{worker_id}/restart"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(restarted["action"], "restart");
+        assert_eq!(restarted["worker"]["status"], "busy");
+
+        let stopped: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/fleet/runs/{}/stop",
+                report.run_id.0
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(stopped["action"], "stop");
+        assert_eq!(stopped["stopped"], 1);
+        assert_eq!(stopped["status"]["cancelled"], 1);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()> {
+        use crate::tools::subagent::{
+            AgentRunArtifactRef, AgentRunFollowUpTarget, AgentRunRecommendedAction,
+            AgentRunTakeoverTarget, AgentRunUsage, AgentRunVerificationSummary, AgentWorkerEvent,
+            AgentWorkerRecord, AgentWorkerSpec, AgentWorkerStatus, AgentWorkerToolProfile,
+            SubAgentType,
+        };
+        use crate::worker_profile::{ModelRoute, ToolScope, WorkerRuntimeProfile};
+        use std::collections::VecDeque;
+
+        let root =
+            std::env::temp_dir().join(format!("codewhale-agent-runs-api-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(workspace.join(".codewhale/state"))?;
+
+        let record = AgentWorkerRecord {
+            spec: AgentWorkerSpec {
+                worker_id: "agent_receipt".to_string(),
+                run_id: "run_receipt".to_string(),
+                parent_run_id: Some("parent_run".to_string()),
+                session_name: Some("receipt_lane".to_string()),
+                objective: "Verify run receipt projection".to_string(),
+                role: Some("verifier".to_string()),
+                agent_type: SubAgentType::Verifier,
+                model: "deepseek-v4-flash".to_string(),
+                workspace: workspace.clone(),
+                git_branch: Some("codex/v0.8.60".to_string()),
+                context_mode: "fresh".to_string(),
+                fork_context: false,
+                tool_profile: AgentWorkerToolProfile::Explicit(vec!["read_file".to_string()]),
+                runtime_profile: {
+                    let mut profile = WorkerRuntimeProfile::for_role(SubAgentType::Verifier);
+                    profile.tools = ToolScope::Explicit(vec!["read_file".to_string()]);
+                    profile.model = ModelRoute::Fixed("deepseek-v4-flash".to_string());
+                    profile.max_spawn_depth =
+                        crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH.saturating_sub(1);
+                    profile
+                },
+                max_steps: 4,
+                spawn_depth: 1,
+                max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
+            },
+            actor_kind: "subagent".to_string(),
+            parent_run_id: Some("parent_run".to_string()),
+            follow_up: AgentRunFollowUpTarget {
+                tool: "handle_read".to_string(),
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                accepted_statuses: vec![
+                    "running".to_string(),
+                    "interrupted_continuable".to_string(),
+                ],
+                latest_delivery: None,
+            },
+            takeover: AgentRunTakeoverTarget {
+                kind: "local_subagent_session".to_string(),
+                supported: true,
+                agent_id: "agent_receipt".to_string(),
+                session_name: Some("receipt_lane".to_string()),
+                instructions: "Use handle_read on the transcript_handle for agent_receipt."
+                    .to_string(),
+                unsupported_reason: None,
+            },
+            artifacts: vec![AgentRunArtifactRef {
+                kind: "transcript".to_string(),
+                name: "transcript_handle".to_string(),
+                target: "agent:agent_receipt".to_string(),
+                description: "Read with handle_read from a live projection.".to_string(),
+            }],
+            usage: AgentRunUsage {
+                status: "unknown".to_string(),
+                total_tokens: None,
+                note: "not reported".to_string(),
+            },
+            verification: AgentRunVerificationSummary {
+                status: "self_report_only".to_string(),
+                summary: "no verified receipt attached".to_string(),
+            },
+            recommended_action: AgentRunRecommendedAction {
+                action: "verify_self_report".to_string(),
+                tool: Some("handle_read".to_string()),
+                reason: "Worker agent_receipt completed; verify its self-report.".to_string(),
+            },
+            status: AgentWorkerStatus::Completed,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            started_at_ms: Some(1),
+            completed_at_ms: Some(2),
+            latest_message: Some("completed".to_string()),
+            result_summary: Some("receipt complete".to_string()),
+            error: None,
+            steps_taken: 2,
+            events: VecDeque::from([AgentWorkerEvent {
+                seq: 1,
+                worker_id: "agent_receipt".to_string(),
+                status: AgentWorkerStatus::Completed,
+                timestamp_ms: 2,
+                message: Some("completed".to_string()),
+                step: Some(2),
+                tool_name: None,
+            }]),
+        };
+        let state_payload = json!({
+            "schema_version": 1,
+            "agents": [],
+            "workers": [record],
+        });
+        fs::write(
+            workspace.join(".codewhale/state/subagents.v1.json"),
+            serde_json::to_vec_pretty(&state_payload)?,
+        )?;
+
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_mobile_workspace(
+                root.clone(),
+                sessions_dir,
+                None,
+                false,
+                workspace,
+            )
+            .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let runs: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(runs["runs"][0]["spec"]["run_id"], "run_receipt");
+        assert_eq!(runs["runs"][0]["follow_up"]["tool"], "handle_read");
+        assert_eq!(
+            runs["runs"][0]["verification"]["status"],
+            "self_report_only"
+        );
+
+        let run: serde_json::Value = client
+            .get(format!("http://{addr}/v1/agent-runs/run_receipt"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(run["spec"]["worker_id"], "agent_receipt");
+        assert_eq!(run["takeover"]["supported"], true);
+        assert_eq!(run["artifacts"][0]["kind"], "transcript");
+
+        let missing = client
+            .get(format!("http://{addr}/v1/agent-runs/missing"))
+            .send()
+            .await?
+            .status();
+        assert_eq!(missing, StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_requires_prompt() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/stream"))
+            .json(&json!({ "prompt": "" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        let archived: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({ "archived": true }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(archived["id"], thread_id);
+        assert_eq!(archived["archived"], true);
+
+        let listed: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            listed
+                .as_array()
+                .is_some_and(|threads| threads.iter().all(|t| t["id"] != thread_id))
+        );
+
+        let listed_all: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/threads/summary?include_archived=true&limit=100"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            listed_all
+                .as_array()
+                .is_some_and(|threads| threads.iter().any(|t| t["id"] == thread_id))
+        );
+
+        let unarchived: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({ "archived": false }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(unarchived["archived"], false);
+
+        let invalid_patch = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(invalid_patch.status(), StatusCode::BAD_REQUEST);
+
+        let missing_patch = client
+            .patch(format!("http://{addr}/v1/threads/thr_missing"))
+            .json(&json!({ "archived": true }))
+            .send()
+            .await?;
+        assert_eq!(missing_patch.status(), StatusCode::NOT_FOUND);
+
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{thread_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["thread"]["id"], thread_id);
+
+        let resumed: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/resume"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(resumed["id"], thread_id);
+
+        let forked: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/fork"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let forked_id = forked["id"].as_str().context("missing forked id")?;
+        assert_ne!(forked_id, thread_id);
+
+        // Install a mock engine so the turn completes without calling the real API.
+        // The mock handles both SendMessage and CompactContext ops so the
+        // compact endpoint tested later also works.
+        let harness = crate::core::engine::mock_engine_handle();
+        runtime_threads
+            .install_test_engine(&thread_id, harness.handle.clone())
+            .await?;
+        let mut rx_op = harness.rx_op;
+        let tx_event = harness.tx_event;
+        tokio::spawn(async move {
+            while let Some(op) = rx_op.recv().await {
+                match op {
+                    Op::SendMessage { .. } => {
+                        let _ = tx_event
+                            .send(EngineEvent::TurnStarted {
+                                turn_id: "mock_lifecycle".to_string(),
+                            })
+                            .await;
+                        let _ = tx_event
+                            .send(EngineEvent::MessageStarted { index: 0 })
+                            .await;
+                        let _ = tx_event
+                            .send(EngineEvent::MessageDelta {
+                                index: 0,
+                                content: "mock reply".to_string(),
+                            })
+                            .await;
+                        let _ = tx_event
+                            .send(EngineEvent::MessageComplete { index: 0 })
+                            .await;
+                        let _ = tx_event
+                            .send(EngineEvent::TurnComplete {
+                                usage: Usage {
+                                    input_tokens: 10,
+                                    output_tokens: 5,
+                                    ..Usage::default()
+                                },
+                                status: TurnOutcomeStatus::Completed,
+                                error: None,
+                                tool_catalog: None,
+                                base_url: None,
+                            })
+                            .await;
+                    }
+                    Op::CompactContext => {
+                        let _ = tx_event
+                            .send(EngineEvent::TurnComplete {
+                                usage: Usage {
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    ..Usage::default()
+                                },
+                                status: TurnOutcomeStatus::Completed,
+                                error: None,
+                                tool_catalog: None,
+                                base_url: None,
+                            })
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let turn_start: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "thread endpoint test" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = turn_start["turn"]["id"]
+            .as_str()
+            .context("missing turn id")?
+            .to_string();
+
+        let _ = wait_for_terminal_turn_status(
+            &client,
+            addr,
+            &thread_id,
+            &turn_id,
+            Duration::from_secs(2),
+        )
+        .await?;
+
+        let steer_resp = client
+            .post(format!(
+                "http://{addr}/v1/threads/{thread_id}/turns/{turn_id}/steer"
+            ))
+            .json(&json!({ "prompt": "late steer" }))
+            .send()
+            .await?;
+        assert_eq!(steer_resp.status(), StatusCode::CONFLICT);
+
+        let interrupt_resp = client
+            .post(format!(
+                "http://{addr}/v1/threads/{thread_id}/turns/{turn_id}/interrupt"
+            ))
+            .send()
+            .await?;
+        assert_eq!(interrupt_resp.status(), StatusCode::CONFLICT);
+
+        let compact_start: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/compact"))
+            .json(&json!({ "reason": "test manual compact" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(compact_start["thread"]["id"], thread_id);
+
+        let events_resp = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/events?since_seq=0"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = events_resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/event-stream"));
+        let chunk_text = read_first_sse_frame(events_resp).await?;
+        assert!(
+            chunk_text.contains("event:"),
+            "expected SSE event chunk, got: {chunk_text}"
+        );
+        let (event_name, payload) = parse_sse_frame(&chunk_text)?;
+        assert_eq!(event_name, "thread.started");
+        assert!(
+            event_name.starts_with("item.")
+                || event_name.starts_with("turn.")
+                || event_name.starts_with("thread.")
+                || event_name == "turn.completed"
+                || event_name == "turn.started"
+                || event_name == "thread.started",
+            "unexpected first event name: {event_name}"
+        );
+        assert_eq!(payload["event"], payload["kind"]);
+        assert!(payload.get("turn_id").is_some());
+        assert!(payload.get("item_id").is_some());
+        assert!(payload["turn_id"].is_null());
+        assert!(payload["item_id"].is_null());
+        assert_eq!(payload["thread_id"], thread_id);
+        assert!(
+            payload["schema_version"]
+                .as_u64()
+                .is_some_and(|version| version >= 1)
+        );
+        assert!(payload.get("seq").and_then(Value::as_u64).is_some());
+        assert!(payload["payload"].is_object() || payload["payload"].is_array());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        // Install a mock engine so the turn completes without calling the real API.
+        let harness = crate::core::engine::mock_engine_handle();
+        runtime_threads
+            .install_test_engine(&thread_id, harness.handle.clone())
+            .await?;
+        let mut rx_op = harness.rx_op;
+        let tx_event = harness.tx_event;
+        tokio::spawn(async move {
+            if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+                return;
+            }
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "mock_cursor".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageStarted { index: 0 })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageComplete { index: 0 })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage {
+                        input_tokens: 5,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        });
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "cursor replay test" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = started["turn"]["id"]
+            .as_str()
+            .context("missing turn id")?
+            .to_string();
+
+        let _ = wait_for_terminal_turn_status(
+            &client,
+            addr,
+            &thread_id,
+            &turn_id,
+            Duration::from_secs(2),
+        )
+        .await?;
+
+        let resp_a = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/events?since_seq=0"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        let frame_a = read_first_sse_frame(resp_a).await?;
+        let (event_a, payload_a) = parse_sse_frame(&frame_a)?;
+        assert_eq!(event_a, "thread.started");
+        assert!(payload_a.get("turn_id").is_some());
+        assert!(payload_a.get("item_id").is_some());
+        assert!(payload_a["turn_id"].is_null());
+        assert!(payload_a["item_id"].is_null());
+        assert!(payload_a.get("schema_version").is_some());
+        assert_eq!(payload_a["event"], payload_a["kind"]);
+        assert_eq!(payload_a["thread_id"], thread_id);
+        let seq_a = payload_a
+            .get("seq")
+            .and_then(Value::as_u64)
+            .context("missing seq in first replay frame")?;
+
+        let resp_b = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/events?since_seq={seq_a}"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        let frame_b = read_first_sse_frame(resp_b).await?;
+        let (_event_b, payload_b) = parse_sse_frame(&frame_b)?;
+        assert!(payload_b.get("schema_version").is_some());
+        assert_eq!(payload_b["event"], payload_b["kind"]);
+        assert_eq!(payload_b["thread_id"], thread_id);
+        let seq_b = payload_b
+            .get("seq")
+            .and_then(Value::as_u64)
+            .context("missing seq in second replay frame")?;
+        assert!(
+            seq_b > seq_a,
+            "expected seq after cursor: {seq_b} <= {seq_a}"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        let harness = crate::core::engine::mock_engine_handle();
+        runtime_threads
+            .install_test_engine(&thread_id, harness.handle.clone())
+            .await?;
+        let mut rx_op = harness.rx_op;
+        let mut rx_steer = harness.rx_steer;
+        let tx_event = harness.tx_event;
+        let cancel_token = harness.cancel_token;
+        tokio::spawn(async move {
+            if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+                return;
+            }
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "engine_turn_api".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageStarted { index: 0 })
+                .await;
+            if let Some(steer_text) = rx_steer.recv().await {
+                let _ = tx_event
+                    .send(EngineEvent::MessageDelta {
+                        index: 0,
+                        content: format!("steer:{steer_text}"),
+                    })
+                    .await;
+            }
+            cancel_token.cancelled().await;
+            sleep(Duration::from_millis(60)).await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage {
+                        input_tokens: 2,
+                        output_tokens: 1,
+                        ..Usage::default()
+                    },
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        });
+
+        let turn_start: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "active controls" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = turn_start["turn"]["id"]
+            .as_str()
+            .context("missing turn id")?
+            .to_string();
+
+        let steer_resp: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/threads/{thread_id}/turns/{turn_id}/steer"
+            ))
+            .json(&json!({ "prompt": "please steer" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(steer_resp["id"], turn_id);
+        assert_eq!(steer_resp["steer_count"], 1);
+
+        let interrupt_resp: serde_json::Value = client
+            .post(format!(
+                "http://{addr}/v1/threads/{thread_id}/turns/{turn_id}/interrupt"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(interrupt_resp["id"], turn_id);
+
+        let terminal = wait_for_terminal_turn_status(
+            &client,
+            addr,
+            &thread_id,
+            &turn_id,
+            Duration::from_secs(3),
+        )
+        .await?;
+        assert_eq!(terminal, "interrupted");
+
+        let events = runtime_threads.events_since(&thread_id, None)?;
+        assert!(events.iter().any(|ev| ev.event == "turn.steered"));
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.event == "turn.interrupt_requested")
+        );
+        assert!(events.iter().any(|ev| {
+            ev.event == "turn.completed"
+                && ev
+                    .payload
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("interrupted")
+        }));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_compat_mapping_handles_expected_runtime_events() -> Result<()> {
+        let agent_delta = RuntimeEventRecord {
+            schema_version: 1,
+            seq: 1,
+            timestamp: chrono::Utc::now(),
+            thread_id: "thr_test".to_string(),
+            turn_id: Some("turn_test".to_string()),
+            item_id: Some("item_test".to_string()),
+            event: "item.delta".to_string(),
+            payload: json!({
+                "kind": "agent_message",
+                "delta": "hello",
+            }),
+        };
+        let mapped = map_compat_stream_event(&agent_delta).context("missing mapped SSE event")?;
+        let stream = async_stream::stream! {
+            yield Ok::<_, Infallible>(mapped);
+        };
+        let body =
+            axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: message.delta"));
+        assert!(text.contains("\"content\":\"hello\""));
+
+        let tool_start = RuntimeEventRecord {
+            schema_version: 1,
+            seq: 2,
+            timestamp: chrono::Utc::now(),
+            thread_id: "thr_test".to_string(),
+            turn_id: Some("turn_test".to_string()),
+            item_id: Some("item_tool".to_string()),
+            event: "item.started".to_string(),
+            payload: json!({
+                "tool": { "id": "tool_1", "name": "exec_shell", "input": { "cmd": "pwd" } }
+            }),
+        };
+        let mapped = map_compat_stream_event(&tool_start).context("missing tool.started event")?;
+        let stream = async_stream::stream! {
+            yield Ok::<_, Infallible>(mapped);
+        };
+        let body =
+            axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: tool.started"));
+
+        let tool_done = RuntimeEventRecord {
+            schema_version: 1,
+            seq: 3,
+            timestamp: chrono::Utc::now(),
+            thread_id: "thr_test".to_string(),
+            turn_id: Some("turn_test".to_string()),
+            item_id: Some("item_tool".to_string()),
+            event: "item.completed".to_string(),
+            payload: json!({
+                "item": {
+                    "id": "item_tool",
+                    "kind": "tool_call",
+                    "summary": "ok",
+                    "detail": "done"
+                }
+            }),
+        };
+        let mapped = map_compat_stream_event(&tool_done).context("missing tool.completed event")?;
+        let stream = async_stream::stream! {
+            yield Ok::<_, Infallible>(mapped);
+        };
+        let body =
+            axum::body::to_bytes(Sse::new(stream).into_response().into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("event: tool.completed"));
+        assert!(text.contains("\"success\":true"));
+
+        let unknown = RuntimeEventRecord {
+            schema_version: 1,
+            seq: 4,
+            timestamp: chrono::Utc::now(),
+            thread_id: "thr_test".to_string(),
+            turn_id: Some("turn_test".to_string()),
+            item_id: None,
+            event: "item.delta".to_string(),
+            payload: json!({
+                "kind": "context_compaction",
+                "delta": "ignored",
+            }),
+        };
+        assert!(map_compat_stream_event(&unknown).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        // Create a thread and install a mock engine so /v1/stream doesn't call the real API.
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        let harness = crate::core::engine::mock_engine_handle();
+        runtime_threads
+            .install_test_engine(&thread_id, harness.handle.clone())
+            .await?;
+        let mut rx_op = harness.rx_op;
+        let tx_event = harness.tx_event;
+        tokio::spawn(async move {
+            if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+                return;
+            }
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "mock_stream".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageStarted { index: 0 })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageDelta {
+                    index: 0,
+                    content: "streamed".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageComplete { index: 0 })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage {
+                        input_tokens: 4,
+                        output_tokens: 2,
+                        ..Usage::default()
+                    },
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        });
+
+        // Start the turn and consume events via the SSE endpoint.
+        let turn_start: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "compatibility stream" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = turn_start["turn"]["id"]
+            .as_str()
+            .context("missing turn id")?
+            .to_string();
+
+        let _ = wait_for_terminal_turn_status(
+            &client,
+            addr,
+            &thread_id,
+            &turn_id,
+            Duration::from_secs(2),
+        )
+        .await?;
+
+        // Verify that the persisted events include the expected turn lifecycle events.
+        let events = runtime_threads.events_since(&thread_id, None)?;
+        assert!(
+            events.iter().any(|ev| ev.event == "turn.started"),
+            "expected turn.started event"
+        );
+        assert!(
+            events.iter().any(|ev| ev.event == "turn.completed"),
+            "expected turn.completed event"
+        );
+
+        // Verify the SSE endpoint returns event-stream content type.
+        let events_resp = client
+            .get(format!(
+                "http://{addr}/v1/threads/{thread_id}/events?since_seq=0"
+            ))
+            .send()
+            .await?
+            .error_for_status()?;
+        let content_type = events_resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/event-stream"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_get_returns_404_for_missing_id() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .get(format!("http://{addr}/v1/sessions/nonexistent_id"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_endpoints_reject_invalid_id() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let get_resp = client
+            .get(format!("http://{addr}/v1/sessions/invalid%20id"))
+            .send()
+            .await?;
+        assert_eq!(get_resp.status(), StatusCode::BAD_REQUEST);
+
+        let resume_resp = client
+            .post(format!(
+                "http://{addr}/v1/sessions/invalid%20id/resume-thread"
+            ))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resume_resp.status(), StatusCode::BAD_REQUEST);
+
+        let delete_resp = client
+            .delete(format!("http://{addr}/v1/sessions/invalid%20id"))
+            .send()
+            .await?;
+        assert_eq!(delete_resp.status(), StatusCode::BAD_REQUEST);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_resume_thread_returns_404_for_missing_session() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!(
+                "http://{addr}/v1/sessions/nonexistent_session/resume-thread"
+            ))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_resume_thread_creates_thread_from_saved_session() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-session-resume-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        fs::create_dir_all(&sessions_dir)?;
+        let session = json!({
+            "schema_version": 1,
+            "metadata": {
+                "id": "sess_test_resume",
+                "title": "Test resume session",
+                "created_at": "2025-01-01T00:00:00Z",
+                "updated_at": "2025-01-01T00:10:00Z",
+                "message_count": 2,
+                "total_tokens": 100,
+                "model": "deepseek-v4-pro",
+                "workspace": "/tmp/test",
+                "mode": "agent"
+            },
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{ "type": "text", "text": "Hello, world!" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "Hello! How can I help you?" }]
+                }
+            ],
+            "system_prompt": null
+        });
+        fs::write(
+            sessions_dir.join("sess_test_resume.json"),
+            serde_json::to_string_pretty(&session)?,
+        )?;
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir.clone()).await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!(
+                "http://{addr}/v1/sessions/sess_test_resume/resume-thread"
+            ))
+            .json(&json!({ "model": "deepseek-v4-pro" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resumed: serde_json::Value = resp.json().await?;
+        assert_eq!(resumed["session_id"], "sess_test_resume");
+        assert_eq!(resumed["message_count"], 2);
+
+        let thread_id = resumed["thread_id"]
+            .as_str()
+            .context("missing resumed thread id")?;
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{thread_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["thread"]["id"], thread_id);
+        assert_eq!(detail["turns"].as_array().map_or(0, Vec::len), 1);
+        assert_eq!(detail["items"].as_array().map_or(0, Vec::len), 2);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_create_from_completed_thread_saves_messages() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-thread-session-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-pro",
+                "mode": "plan",
+                "workspace": root.join("workspace")
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        let patched: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({ "title": "Thread title fallback" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(patched["title"], "Thread title fallback");
+
+        runtime_threads
+            .seed_thread_from_messages(
+                &thread_id,
+                &[
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Please save this runtime thread".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Saved replies should round-trip.".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                ],
+            )
+            .await?;
+
+        let resp = client
+            .post(format!("http://{addr}/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let saved: serde_json::Value = resp.json().await?;
+        assert_eq!(saved["thread_id"], thread_id);
+        assert_eq!(saved["message_count"], 2);
+        assert_eq!(saved["title"], "Thread title fallback");
+        let session_id = saved["session_id"]
+            .as_str()
+            .context("missing session id")?
+            .to_string();
+
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/sessions/{session_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["metadata"]["title"], "Thread title fallback");
+        assert_eq!(detail["metadata"]["model"], "deepseek-v4-pro");
+        assert_eq!(detail["metadata"]["mode"], "plan");
+        assert_eq!(detail["metadata"]["message_count"], 2);
+        assert_eq!(detail["messages"][0]["role"], "user");
+        assert_eq!(
+            detail["messages"][0]["content"][0]["text"],
+            "Please save this runtime thread"
+        );
+        assert_eq!(detail["messages"][1]["role"], "assistant");
+
+        let manual_title: serde_json::Value = client
+            .post(format!("http://{addr}/v1/sessions"))
+            .json(&json!({
+                "thread_id": thread_id,
+                "title": "Manual saved title"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(manual_title["title"], "Manual saved title");
+        assert_ne!(manual_title["session_id"], session_id);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_create_from_thread_returns_404_for_missing_thread() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/sessions"))
+            .json(&json!({ "thread_id": "thr_missing" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// Create a thread over HTTP and seed it with one user/assistant turn.
+    /// Shared setup for the undo/patch-undo/retry endpoint tests.
+    async fn create_seeded_thread(
+        addr: &SocketAddr,
+        runtime_threads: &SharedRuntimeThreadManager,
+        root: &FsPath,
+        user_text: &str,
+    ) -> Result<String> {
+        let client = crate::tls::reqwest_client();
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-pro",
+                "mode": "agent",
+                "workspace": root.join("workspace")
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        runtime_threads
+            .seed_thread_from_messages(
+                &thread_id,
+                &[
+                    Message {
+                        role: "user".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: user_text.to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "Done — anything else?".to_string(),
+                            cache_control: None,
+                        }],
+                    },
+                ],
+            )
+            .await?;
+        Ok(thread_id)
+    }
+
+    #[tokio::test]
+    async fn undo_endpoint_forks_thread_and_returns_original_user_text() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-undo-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Please undo this turn").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let undone: serde_json::Value = resp.json().await?;
+        assert_eq!(undone["original_user_text"], "Please undo this turn");
+        let forked_id = undone["thread"]["id"]
+            .as_str()
+            .context("missing forked thread id")?;
+        assert_ne!(forked_id, thread_id, "undo must fork, not mutate in place");
+
+        // The forked thread has the undone turn removed.
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads/{forked_id}"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(detail["turns"].as_array().map_or(usize::MAX, Vec::len), 0);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn undo_endpoint_404s_for_missing_thread() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/thr_missing/undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_undo_endpoint_forks_and_reports_file_rollback_state() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("deepseek-patch-undo-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Roll back the patch").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/patch-undo"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let undone: serde_json::Value = resp.json().await?;
+        // The fresh workspace has no tool/pre-turn snapshots to roll back to,
+        // so the file-restore step reports failure while the conversation
+        // undo still forks the thread.
+        assert_eq!(undone["patch_result"]["files_restored"], false);
+        assert!(undone["patch_result"]["summary"].is_string());
+        assert_eq!(undone["original_user_text"], "Roll back the patch");
+        assert_ne!(undone["thread"]["id"].as_str(), Some(thread_id.as_str()));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_endpoint_reuses_dropped_user_text_to_start_a_turn() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("deepseek-retry-endpoint-{}", Uuid::new_v4()));
+        let sessions_dir = root.join("sessions");
+        let Some((addr, runtime_threads, handle)) =
+            spawn_test_server_with_root(root.clone(), sessions_dir).await?
+        else {
+            return Ok(());
+        };
+        let thread_id =
+            create_seeded_thread(&addr, &runtime_threads, &root, "Retry this request").await?;
+        let client = crate::tls::reqwest_client();
+
+        let resp = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/retry"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let retried: serde_json::Value = resp.json().await?;
+        let forked_id = retried["thread"]["id"]
+            .as_str()
+            .context("missing forked thread id")?;
+        assert_ne!(forked_id, thread_id);
+        assert_eq!(retried["turn"]["thread_id"], forked_id);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn restore_snapshot_endpoint_helper_restores_workspace_files() -> Result<()> {
+        let _lock = lock_test_env();
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+        let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+        fs::write(workspace.join("a.txt"), "v1")?;
+        let snapshot_id = repo.snapshot("pre-turn:1")?;
+        fs::write(workspace.join("a.txt"), "v2")?;
+
+        restore_snapshot_for_workspace(&workspace, snapshot_id.as_str())
+            .expect("snapshot restore should succeed");
+        assert_eq!(fs::read_to_string(workspace.join("a.txt"))?, "v1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        let harness = crate::core::engine::mock_engine_handle();
+        runtime_threads
+            .install_test_engine(&thread_id, harness.handle.clone())
+            .await?;
+        let mut rx_op = harness.rx_op;
+        let tx_event = harness.tx_event;
+        let (active_tx, active_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            if !matches!(rx_op.recv().await, Some(Op::SendMessage { .. })) {
+                return;
+            }
+            let _ = tx_event
+                .send(EngineEvent::TurnStarted {
+                    turn_id: "mock_active_session_save".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageStarted { index: 0 })
+                .await;
+            let _ = active_tx.send(());
+            let _ = finish_rx.await;
+            let _ = tx_event
+                .send(EngineEvent::MessageDelta {
+                    index: 0,
+                    content: "now complete".to_string(),
+                })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::MessageComplete { index: 0 })
+                .await;
+            let _ = tx_event
+                .send(EngineEvent::TurnComplete {
+                    usage: Usage {
+                        input_tokens: 2,
+                        output_tokens: 1,
+                        ..Usage::default()
+                    },
+                    status: TurnOutcomeStatus::Completed,
+                    error: None,
+                    tool_catalog: None,
+                    base_url: None,
+                })
+                .await;
+        });
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({ "prompt": "save me while active" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let turn_id = started["turn"]["id"]
+            .as_str()
+            .context("missing turn id")?
+            .to_string();
+        tokio::time::timeout(Duration::from_secs(2), active_rx)
+            .await
+            .context("timed out waiting for mock active turn")?
+            .context("mock active turn sender dropped")?;
+        wait_for_in_progress_item(&client, addr, &thread_id, Duration::from_secs(2)).await?;
+
+        let resp = client
+            .post(format!("http://{addr}/v1/sessions"))
+            .json(&json!({ "thread_id": thread_id }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = resp.json().await?;
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("queued or active turn"))
+        );
+
+        let _ = finish_tx.send(());
+        let terminal = wait_for_terminal_turn_status(
+            &client,
+            addr,
+            &thread_id,
+            &turn_id,
+            Duration::from_secs(2),
+        )
+        .await?;
+        assert_eq!(terminal, "completed");
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn snapshots_endpoint_lists_workspace_snapshots() -> Result<()> {
+        let _lock = lock_test_env();
+        let root = tempfile::tempdir()?;
+        let home = root.path().join("home");
+        fs::create_dir_all(&home)?;
+        let _home = EnvVarGuard::set("HOME", &home);
+
+        let workspace = root.path().join("workspace");
+        fs::create_dir_all(&workspace)?;
+        let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace)?;
+        fs::write(workspace.join("a.txt"), "v1")?;
+        repo.snapshot("pre-turn:1")?;
+        fs::write(workspace.join("a.txt"), "v2")?;
+        repo.snapshot("post-turn:1")?;
+
+        let snapshots =
+            snapshot_entries_for_workspace(&workspace, SnapshotsQuery { limit: Some(1) })
+                .expect("snapshot listing should succeed");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].label, "post-turn:1");
+        assert!(snapshots[0].id.len() >= 8);
+        assert!(snapshots[0].timestamp > 0);
+
+        let bad_limit =
+            snapshot_entries_for_workspace(&workspace, SnapshotsQuery { limit: Some(101) })
+                .expect_err("limit above cap should fail");
+        assert_eq!(bad_limit.status, StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_delete_returns_404_for_missing_id() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .delete(format!("http://{addr}/v1/sessions/nonexistent-id"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+        Ok(())
+    }
+
+    /// #561 / whalescale#255 — extra CORS origins from `RuntimeApiOptions`
+    /// are added on top of the built-in defaults and propagate through to the
+    /// `Access-Control-Allow-Origin` response header for preflight requests.
+    /// Built-in defaults must keep working unchanged.
+    #[tokio::test]
+    async fn cors_layer_appends_extra_origins_and_keeps_defaults() -> Result<()> {
+        // The cors_layer fn is the layer factory — exercise it through a
+        // Router with a single trivial route so we can issue OPTIONS preflights
+        // and observe the response headers.
+        let extra = vec!["http://localhost:5173".to_string()];
+        let layer = cors_layer(&extra);
+        let router: Router = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .layer(layer);
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let client = crate::tls::reqwest_client();
+
+        // The user-supplied origin is allowed.
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+            .header("Origin", "http://localhost:5173")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:5173")
+        );
+
+        // A built-in default origin still works.
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+            .header("Origin", "http://localhost:1420")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("http://localhost:1420")
+        );
+
+        // An origin that's neither configured nor a default is rejected
+        // (CorsLayer omits the Allow-Origin header on mismatch).
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
+            .header("Origin", "http://malicious.example")
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+            .await?;
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "non-allowed origin must not be echoed back"
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// #561 — invalid origins (non-ASCII, etc.) are skipped without aborting
+    /// the layer build.
+    #[test]
+    fn cors_layer_skips_invalid_origins() {
+        let extras = vec![
+            "http://valid.example".to_string(),
+            // Embedded NUL char makes `HeaderValue::from_str` fail.
+            "http://invalid.example\0".to_string(),
+            "  ".to_string(), // whitespace-only is dropped
+        ];
+        // Should not panic.
+        let _ = cors_layer(&extras);
+    }
+
+    /// #562 / whalescale#256 — `PATCH /v1/threads/{id}` accepts the new
+    /// fields (allow_shell, trust_mode, auto_approve, model, mode, title,
+    /// system_prompt). Each is independently optional; an empty string clears
+    /// `title` / `system_prompt` back to None.
+    #[tokio::test]
+    async fn patch_thread_accepts_extended_field_set() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "deepseek-v4-flash",
+                "mode": "agent"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"]
+            .as_str()
+            .context("missing thread id")?
+            .to_string();
+
+        // Patch every new field at once.
+        let patched: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({
+                "allow_shell": true,
+                "trust_mode": true,
+                "auto_approve": true,
+                "model": "deepseek-v4-pro",
+                "mode": "yolo",
+                "title": "Whalescale UI test thread",
+                "system_prompt": "You are a useful assistant."
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        assert_eq!(patched["allow_shell"], true);
+        assert_eq!(patched["trust_mode"], true);
+        assert_eq!(patched["auto_approve"], true);
+        assert_eq!(patched["model"], "deepseek-v4-pro");
+        assert_eq!(patched["mode"], "yolo");
+        assert_eq!(patched["title"], "Whalescale UI test thread");
+        assert_eq!(patched["system_prompt"], "You are a useful assistant.");
+
+        // Empty string clears title back to None.
+        let cleared: serde_json::Value = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({ "title": "" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(
+            cleared["title"].is_null() || !cleared.as_object().unwrap().contains_key("title"),
+            "empty title must serialize as None: {cleared:?}"
+        );
+
+        // Empty patch (no fields) is still rejected.
+        let empty = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({}))
+            .send()
+            .await?;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        // Empty model is rejected (validation).
+        let bad_model = client
+            .patch(format!("http://{addr}/v1/threads/{thread_id}"))
+            .json(&json!({ "model": "  " }))
+            .send()
+            .await?;
+        assert_eq!(bad_model.status(), StatusCode::BAD_REQUEST);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// #563 / whalescale#260 — `archived_only=true` returns archived-only
+    /// (no active threads), distinct from `include_archived=true` which
+    /// returns both.
+    #[tokio::test]
+    async fn list_threads_archived_only_filter_matches_only_archived() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        // Two threads — keep one active, archive the other.
+        let active: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let active_id = active["id"].as_str().unwrap().to_string();
+
+        let archived: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let archived_id = archived["id"].as_str().unwrap().to_string();
+
+        client
+            .patch(format!("http://{addr}/v1/threads/{archived_id}"))
+            .json(&json!({ "archived": true }))
+            .send()
+            .await?
+            .error_for_status()?;
+
+        // Default (active only) → only the unarchived one.
+        let active_list: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let ids: Vec<&str> = active_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert!(ids.contains(&active_id.as_str()));
+        assert!(!ids.contains(&archived_id.as_str()));
+
+        // archived_only=true → only the archived one.
+        let archived_list: serde_json::Value = client
+            .get(format!("http://{addr}/v1/threads?archived_only=true"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let ids: Vec<&str> = archived_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![archived_id.as_str()]);
+
+        // archived_only=true takes precedence over include_archived=true.
+        let archived_list: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/threads?include_archived=true&archived_only=true"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let ids: Vec<&str> = archived_list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![archived_id.as_str()]);
+
+        // Same filter works on the summary endpoint.
+        let summary: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/v1/threads/summary?archived_only=true&limit=10"
+            ))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let summary_ids: Vec<&str> = summary
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["id"].as_str())
+            .collect();
+        assert_eq!(summary_ids, vec![archived_id.as_str()]);
+
+        handle.abort();
+        Ok(())
+    }
+
+    /// #564 / whalescale#261 — `GET /v1/usage` aggregates per-turn token +
+    /// cost data. With no threads the response is well-formed and totals are
+    /// zero with empty buckets (never a 404).
+    #[tokio::test]
+    async fn usage_endpoint_returns_empty_aggregation_for_fresh_store() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/v1/usage"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(body["group_by"], "day");
+        assert_eq!(body["totals"]["input_tokens"], 0);
+        assert_eq!(body["totals"]["output_tokens"], 0);
+        assert_eq!(body["totals"]["turns"], 0);
+        assert!(
+            body["buckets"].as_array().unwrap().is_empty(),
+            "buckets must be empty when no turns exist: {body}"
+        );
+
+        // group_by query options are validated.
+        let bad_group = client
+            .get(format!("http://{addr}/v1/usage?group_by=galaxy"))
+            .send()
+            .await?;
+        assert_eq!(bad_group.status(), StatusCode::BAD_REQUEST);
+
+        // Each accepted group_by value succeeds.
+        for gb in ["day", "model", "provider", "thread"] {
+            let resp = client
+                .get(format!("http://{addr}/v1/usage?group_by={gb}"))
+                .send()
+                .await?;
+            assert!(resp.status().is_success(), "group_by={gb} failed: {resp:?}");
+        }
+
+        // Bad ISO-8601 timestamp rejected.
+        let bad_since = client
+            .get(format!("http://{addr}/v1/usage?since=not-a-date"))
+            .send()
+            .await?;
+        assert_eq!(bad_since.status(), StatusCode::BAD_REQUEST);
+
+        // since > until rejected.
+        let inverted = client
+            .get(format!(
+                "http://{addr}/v1/usage?since=2030-01-02T00:00:00Z&until=2030-01-01T00:00:00Z"
+            ))
+            .send()
+            .await?;
+        assert_eq!(inverted.status(), StatusCode::BAD_REQUEST);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_info_reports_bind_state() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let info: serde_json::Value = client
+            .get(format!("http://{addr}/v1/runtime/info"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(info["service"], "codewhale-runtime-api");
+        assert_eq!(info["runtime_api_version"], "1.0");
+        assert_eq!(info["codewhale_version"], info["version"]);
+        assert_eq!(info["bind_host"], "127.0.0.1");
+        assert_eq!(info["auth_required"], false);
+        assert!(info["version"].is_string());
+        assert_eq!(info["transports"], json!(["http", "sse"]));
+        assert_eq!(info["capabilities"]["threads"], true);
+        assert_eq!(info["capabilities"]["external_tools"], false);
+        assert!(info["experimental"].is_object());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_thread_accepts_dynamic_tools_and_environments() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({
+                "model": "test-model",
+                "dynamic_tools": [
+                    {
+                        "namespace": "tau_bench",
+                        "name": "get_reservation",
+                        "description": "Look up a reservation.",
+                        "input_schema": { "type": "object" }
+                    }
+                ],
+                "environments": [
+                    { "environment_id": "local", "cwd": "/workspace" }
+                ]
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert!(created["id"].is_string());
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_turn_accepts_dynamic_tools_and_environment_id() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let created: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads"))
+            .json(&json!({ "model": "test-model" }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let thread_id = created["id"].as_str().context("missing thread id")?;
+
+        let started: serde_json::Value = client
+            .post(format!("http://{addr}/v1/threads/{thread_id}/turns"))
+            .json(&json!({
+                "prompt": "hello",
+                "dynamic_tools": [
+                    {
+                        "name": "simple_tool",
+                        "description": "A simple tool.",
+                        "input_schema": { "type": "object" }
+                    }
+                ],
+                "environment_id": "local"
+            }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(started["turn"]["thread_id"], thread_id);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_page_is_available_only_when_enabled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_root_token_and_mobile(
+            root.clone(),
+            sessions_dir.clone(),
+            None,
+            false,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let disabled = client.get(format!("http://{addr}/mobile")).send().await?;
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+        handle.abort();
+
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_and_mobile(root, sessions_dir, None, true).await?
+        else {
+            return Ok(());
+        };
+        let enabled = client
+            .get(format!("http://{addr}/mobile"))
+            .send()
+            .await?
+            .error_for_status()?;
+        let html = enabled.text().await?;
+        assert!(html.contains("FuFan Teaching Agent Mobile"));
+        assert!(html.contains("/v1/approvals/"));
+        assert!(html.contains("MAX_VISIBLE_EVENTS = 100"));
+        assert!(html.contains("replay_limit="));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_page_requires_runtime_token_when_auth_enabled() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let token = "abc ABC+/?:=&%".to_string();
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_root_token_and_mobile(
+            root,
+            sessions_dir,
+            Some(token.clone()),
+            true,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let unauthorized = client.get(format!("http://{addr}/mobile")).send().await?;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let encoded = url_query_component(&token);
+        let query = client
+            .get(format!("http://{addr}/mobile?token={encoded}"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(query.text().await?.contains("FuFan Teaching Agent Mobile"));
+
+        let bearer = client
+            .get(format!("http://{addr}/mobile"))
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(bearer.text().await?.contains("FuFan Teaching Agent Mobile"));
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mobile_insecure_mode_allows_page_and_v1_routes_without_token() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().to_path_buf();
+        let sessions_dir = root.join("sessions");
+        let Some((addr, _runtime_threads, handle)) =
+            spawn_test_server_with_root_token_and_mobile(root, sessions_dir, None, true).await?
+        else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+
+        let page = client
+            .get(format!("http://{addr}/mobile"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(page.text().await?.contains("FuFan Teaching Agent Mobile"));
+
+        let summary = client
+            .get(format!("http://{addr}/v1/threads/summary"))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(summary.status(), StatusCode::OK);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_404s_when_nothing_pending() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/no_such_id"))
+            .json(&json!({ "decision": "allow" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_400s_on_bad_decision() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/whatever"))
+            .json(&json!({ "decision": "yolo" }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn decide_approval_delivers_to_runtime() -> Result<()> {
+        let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let rx = runtime_threads.register_pending_approval_for_test("ext_id");
+
+        let resp = client
+            .post(format!("http://{addr}/v1/approvals/ext_id"))
+            .json(&json!({ "decision": "allow", "remember": false }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["decision"], "allow");
+        assert_eq!(body["delivered"], true);
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx).await??;
+        assert_eq!(
+            received,
+            ExternalApprovalDecision::Allow { remember: false }
+        );
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skills_endpoint_includes_enabled_field() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let body: serde_json::Value = client
+            .get(format!("http://{addr}/v1/skills"))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        if let Some(skills) = body["skills"].as_array() {
+            for skill in skills {
+                assert!(skill.get("enabled").is_some());
+            }
+        }
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skill_toggle_endpoint_404s_for_unknown_skill() -> Result<()> {
+        let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+            return Ok(());
+        };
+        let client = crate::tls::reqwest_client();
+        let resp = client
+            .post(format!("http://{addr}/v1/skills/no-such-skill"))
+            .json(&json!({ "enabled": false }))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        handle.abort();
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_skills_dir_finds_workspace_local_agents_skills() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let local_skills = workspace.join(".agents").join("skills");
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, workspace);
+
+        let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn resolve_skills_dir_finds_workspace_local_skills_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let local_skills = workspace.join("skills");
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, workspace);
+
+        let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
+        assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn skills_search_directories_includes_custom_skills_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let custom_skills = tmp.path().join("custom-skills");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&custom_skills).expect("create custom skills");
+
+        let directories = skills_search_directories(&workspace, &custom_skills);
+
+        assert!(
+            directories.iter().any(|dir| dir == &custom_skills),
+            "custom skills_dir must be reported when discovery searches it"
+        );
+        let message = format_skill_search_paths(&directories);
+        assert!(message.contains("custom-skills"));
+    }
+
+    #[test]
+    fn skill_entry_is_bundled_requires_configured_bundle_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bundled_skills_dir = tmp.path().join("bundled-skills");
+        let bundled_skill_path = bundled_skills_dir.join("delegate").join("SKILL.md");
+        let override_skill_path = tmp
+            .path()
+            .join("workspace")
+            .join(".agents")
+            .join("skills")
+            .join("delegate")
+            .join("SKILL.md");
+        fs::create_dir_all(bundled_skill_path.parent().expect("bundled parent"))
+            .expect("create bundled skill dir");
+        fs::create_dir_all(override_skill_path.parent().expect("override parent"))
+            .expect("create override skill dir");
+        fs::write(
+            &bundled_skill_path,
+            "---\nname: delegate\ndescription: bundled\n---\n",
+        )
+        .expect("write bundled skill");
+        fs::write(
+            &override_skill_path,
+            "---\nname: delegate\ndescription: override\n---\n",
+        )
+        .expect("write override skill");
+
+        let bundled_skill = crate::skills::Skill {
+            name: "delegate".to_string(),
+            description: String::new(),
+            body: String::new(),
+            path: bundled_skill_path,
+        };
+        let override_skill = crate::skills::Skill {
+            name: "delegate".to_string(),
+            description: String::new(),
+            body: String::new(),
+            path: override_skill_path,
+        };
+
+        assert!(skill_entry_is_bundled(&bundled_skill, &bundled_skills_dir));
+        assert!(!skill_entry_is_bundled(
+            &override_skill,
+            &bundled_skills_dir
+        ));
+    }
+
+    /// A `skills` symlink that points outside the workspace must NOT be
+    /// returned as the resolved skills directory. Containment check ensures
+    /// the canonicalized candidate stays under the canonicalized workspace
+    /// root, so a malicious or misconfigured symlink can't promote
+    /// `/etc` (or any other path) into the skills loader.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace_root = tmp.path().join("workspace");
+        let escape_target = tmp.path().join("escape_target");
+        fs::create_dir_all(&workspace_root).expect("create workspace");
+        fs::create_dir_all(&escape_target).expect("create escape target");
+
+        let dotagents = workspace_root.join(".agents");
+        fs::create_dir_all(&dotagents).expect("create .agents");
+        let bad_link = dotagents.join("skills");
+        std::os::unix::fs::symlink(&escape_target, &bad_link).expect("symlink");
+
+        let config = Config::default();
+        let resolved = resolve_skills_dir(&config, &workspace_root);
+
+        let canon_escape = fs::canonicalize(&escape_target).expect("canon escape");
+        assert_ne!(
+            resolved, canon_escape,
+            "symlink escaping workspace must not be resolved as skills dir"
+        );
+        assert_eq!(
+            resolved,
+            config.skills_dir(),
+            "with no valid in-workspace skills dir, resolution should fall back to config"
+        );
+    }
+}
