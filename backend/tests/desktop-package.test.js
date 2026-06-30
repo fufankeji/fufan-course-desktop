@@ -29,7 +29,9 @@ test("desktop resource staging copies runtime assets but excludes local sqlite s
   await fs.writeFile(path.join(sourceRoot, "backend", "knowledge", "manifest.json"), "{}");
   await fs.writeFile(path.join(sourceRoot, "backend", "runtime-packs", "context-engineering", "manifest.json"), "{}");
   await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "codewhale-tui"), "binary");
+  await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "fufan-pty-bridge"), "bridge");
   await fs.writeFile(path.join(sourceRoot, "backend", "data", "settings.sqlite"), "secret");
+  await fs.writeFile(path.join(sourceRoot, "backend", "data", "settings.json"), '{"secret":true}');
   await fs.writeFile(path.join(sourceRoot, "frontend", "index.html"), "<main></main>");
 
   const result = await copyDesktopResources({ projectRoot: sourceRoot, stagingRoot });
@@ -43,7 +45,12 @@ test("desktop resource staging copies runtime assets but excludes local sqlite s
     await fs.readFile(path.join(stagingRoot, "backend", "runtime", "bin", "codewhale-tui"), "utf8"),
     "binary",
   );
+  assert.equal(
+    await fs.readFile(path.join(stagingRoot, "backend", "runtime", "bin", "fufan-pty-bridge"), "utf8"),
+    "bridge",
+  );
   assert.equal(await pathExists(path.join(stagingRoot, "backend", "data", "settings.sqlite")), false);
+  assert.equal(await pathExists(path.join(stagingRoot, "backend", "data", "settings.json")), false);
   assert.equal(await pathExists(path.join(stagingRoot, "frontend", "index.html")), true);
 });
 
@@ -62,6 +69,7 @@ test("desktop resource staging copies the Windows FuFan Agent runtime name", asy
   await fs.writeFile(path.join(sourceRoot, "backend", "knowledge", "manifest.json"), "{}");
   await fs.writeFile(path.join(sourceRoot, "backend", "runtime-packs", "context-engineering", "manifest.json"), "{}");
   await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "codewhale-tui.exe"), "MZ windows runtime");
+  await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "fufan-pty-bridge.exe"), "MZ windows bridge");
   await fs.writeFile(path.join(sourceRoot, "frontend", "index.html"), "<main></main>");
 
   const result = await copyDesktopResources({
@@ -75,7 +83,51 @@ test("desktop resource staging copies the Windows FuFan Agent runtime name", asy
     await fs.readFile(path.join(stagingRoot, "backend", "runtime", "bin", "codewhale-tui.exe"), "utf8"),
     "MZ windows runtime",
   );
+  assert.equal(
+    await fs.readFile(path.join(stagingRoot, "backend", "runtime", "bin", "fufan-pty-bridge.exe"), "utf8"),
+    "MZ windows bridge",
+  );
   assert.equal(await pathExists(path.join(stagingRoot, "backend", "runtime", "bin", "codewhale-tui")), false);
+  assert.equal(await pathExists(path.join(stagingRoot, "backend", "runtime", "bin", "fufan-pty-bridge")), false);
+});
+
+test("desktop resource staging excludes generated runtime pack state", async () => {
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "fufan-desktop-runtime-state-"));
+  const sourceRoot = path.join(fixture, "source");
+  const stagingRoot = path.join(fixture, "src-tauri", "resources");
+  const packRoot = path.join(sourceRoot, "backend", "runtime-packs", "context-engineering");
+
+  await fs.mkdir(path.join(sourceRoot, "backend", "server"), { recursive: true });
+  await fs.mkdir(path.join(sourceRoot, "backend", "knowledge"), { recursive: true });
+  await fs.mkdir(path.join(sourceRoot, "backend", "runtime", "bin"), { recursive: true });
+  await fs.mkdir(path.join(sourceRoot, "frontend"), { recursive: true });
+  await fs.mkdir(path.join(packRoot, ".codewhale-home"), { recursive: true });
+  await fs.mkdir(path.join(packRoot, ".course-session"), { recursive: true });
+  await fs.mkdir(path.join(packRoot, ".deepseek"), { recursive: true });
+  await fs.mkdir(path.join(packRoot, "exports"), { recursive: true });
+  await fs.mkdir(path.join(packRoot, ".codewhale"), { recursive: true });
+
+  await fs.writeFile(path.join(sourceRoot, "backend", "server", "index.js"), "server");
+  await fs.writeFile(path.join(sourceRoot, "backend", "knowledge", "manifest.json"), "{}");
+  await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "codewhale-tui"), "binary");
+  await fs.writeFile(path.join(sourceRoot, "backend", "runtime", "bin", "fufan-pty-bridge"), "bridge");
+  await fs.writeFile(path.join(sourceRoot, "frontend", "index.html"), "<main></main>");
+  await fs.writeFile(path.join(packRoot, "manifest.json"), "{}");
+  await fs.writeFile(path.join(packRoot, ".codewhale-home", "config.toml"), "secret");
+  await fs.writeFile(path.join(packRoot, ".course-session", "source.md"), "generated");
+  await fs.writeFile(path.join(packRoot, ".deepseek", "trusted"), "generated");
+  await fs.writeFile(path.join(packRoot, "exports", "session.jsonl"), "generated");
+  await fs.writeFile(path.join(packRoot, ".codewhale", "config.toml"), "generated");
+
+  await copyDesktopResources({ projectRoot: sourceRoot, stagingRoot });
+
+  const stagedPack = path.join(stagingRoot, "backend", "runtime-packs", "context-engineering");
+  assert.equal(await pathExists(path.join(stagedPack, "manifest.json")), true);
+  assert.equal(await pathExists(path.join(stagedPack, ".codewhale-home")), false);
+  assert.equal(await pathExists(path.join(stagedPack, ".course-session")), false);
+  assert.equal(await pathExists(path.join(stagedPack, ".deepseek")), false);
+  assert.equal(await pathExists(path.join(stagedPack, "exports")), false);
+  assert.equal(await pathExists(path.join(stagedPack, ".codewhale")), false);
 });
 
 test("sidecar binary names match Tauri externalBin target naming", () => {

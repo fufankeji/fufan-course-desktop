@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -10,6 +9,7 @@ import { createApp } from "../server/app.js";
 import { SettingsStore } from "../server/settings-store.js";
 import {
   buildTerminalLaunch,
+  defaultPtyBridgeRuntimePath,
   defaultTuiRuntimePath,
   getTerminalRuntimeStatus,
   normalizeTerminalSize,
@@ -42,6 +42,8 @@ test("terminal runtime status finds the bundled CodeWhale TUI binary", async () 
 test("terminal runtime path uses a Windows executable on Windows", () => {
   assert.equal(defaultTuiRuntimePath("win32"), path.join("runtime", "bin", "codewhale-tui.exe"));
   assert.equal(defaultTuiRuntimePath("darwin"), path.join("runtime", "bin", "codewhale-tui"));
+  assert.equal(defaultPtyBridgeRuntimePath("win32"), path.join("runtime", "bin", "fufan-pty-bridge.exe"));
+  assert.equal(defaultPtyBridgeRuntimePath("darwin"), path.join("runtime", "bin", "fufan-pty-bridge"));
 });
 
 test("terminal launch config uses the skill pack workspace and DeepSeek env", async () => {
@@ -54,9 +56,13 @@ test("terminal launch config uses the skill pack workspace and DeepSeek env", as
     },
   });
 
-  assert.match(launch.command, /python3$/);
-  assert.match(launch.args[0], /pty_bridge\.py$/);
-  assert.match(launch.args[1], /runtime\/bin\/codewhale-tui$/);
+  assert.match(launch.command, /runtime\/bin\/fufan-pty-bridge$/);
+  assert.deepEqual(launch.args.slice(0, 4), [
+    path.resolve(projectRoot, "runtime", "bin", "codewhale-tui"),
+    "100",
+    "30",
+    launch.resizeControlFile,
+  ]);
   assert.match(launch.cwd, /runtime-packs\/context-engineering$/);
   assert.equal(launch.env.DEEPSEEK_API_KEY, "test-key");
   assert.equal(launch.env.DEEPSEEK_MODEL, "deepseek-v4-flash");
@@ -254,46 +260,32 @@ test("terminal size normalization clamps rows and columns", () => {
   assert.deepEqual(normalizeTerminalSize({ cols: 9999, rows: 9999 }), { cols: 500, rows: 200 });
 });
 
-test("pty bridge applies resize control file updates to the child pty", { skip: process.platform === "win32" }, async () => {
-  const bridge = path.join(projectRoot, "server", "pty_bridge.py");
-  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "course-pty-resize-"));
-  const controlFile = path.join(temp, "resize.json");
-  const child = spawn(process.env.PYTHON || process.env.PYTHON3 || "python3", [bridge, "/bin/sh", "80", "24", controlFile], {
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  let output = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    output += chunk;
-  });
-  child.stderr.on("data", (chunk) => {
-    output += chunk;
-  });
-
-  await new Promise((resolve) => setTimeout(resolve, 150));
-  await fs.writeFile(controlFile, JSON.stringify({ cols: 123, rows: 41 }), "utf8");
-  child.kill("SIGUSR1");
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  child.stdin.end("stty size\nexit\n");
-
-  const exitCode = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`pty_bridge resize test timed out. Output:\n${output}`));
-    }, 5_000);
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      resolve(code);
-    });
+test("terminal resize writes the bridge control file without Unix signals", async () => {
+  const root = await createRuntimeFixture();
+  const kills = [];
+  const manager = new TerminalManager({
+    projectRoot: root,
+    env: { DEEPSEEK_API_KEY: "test-key" },
+    spawnImpl() {
+      const child = createFakeChildProcess();
+      child.kill = (signal = "SIGTERM") => {
+        kills.push(signal);
+        child.killed = true;
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+        return true;
+      };
+      return child;
+    },
   });
 
-  assert.equal(exitCode, 0);
-  assert.match(output, /41\s+123/);
+  const started = await manager.startSession({ packId: "context-engineering", cols: 80, rows: 24 });
+  await manager.resizeSession(started.id, { cols: 123, rows: 41 });
+
+  const session = manager.getSession(started.id);
+  const payload = JSON.parse(await fs.readFile(session.launch.resizeControlFile, "utf8"));
+  assert.deepEqual(payload, { cols: 123, rows: 41 });
+  assert.deepEqual(kills, []);
 });
 
 async function createRuntimeFixture() {
@@ -302,6 +294,7 @@ async function createRuntimeFixture() {
   await fs.mkdir(path.join(packRoot, ".codewhale"), { recursive: true });
   await fs.mkdir(path.join(root, "runtime", "bin"), { recursive: true });
   await fs.writeFile(path.join(root, "runtime", "bin", "codewhale-tui"), "", { mode: 0o755 });
+  await fs.writeFile(path.join(root, "runtime", "bin", "fufan-pty-bridge"), "", { mode: 0o755 });
   await fs.writeFile(path.join(packRoot, ".codewhale", "config.toml"), 'provider = "deepseek"\n');
   await fs.writeFile(
     path.join(packRoot, "skill-manifest.json"),

@@ -28,6 +28,7 @@ test("release smoke copies packaged resources into a writable runtime root", asy
   assert.equal(await pathExists(path.join(result.backendRoot, "server", "index.js")), true);
   assert.equal(await pathExists(path.join(result.backendRoot, "data")), true);
   assert.equal(await pathExists(path.join(result.backendRoot, "data", "settings.sqlite")), false);
+  assert.equal(await pathExists(path.join(result.backendRoot, "data", "settings.json")), false);
   assert.equal(await fs.readFile(path.join(result.frontendRoot, "index.html"), "utf8"), "<main>课程平台</main>");
 });
 

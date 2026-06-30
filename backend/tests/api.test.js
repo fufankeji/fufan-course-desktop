@@ -463,7 +463,7 @@ test("server serves vendored terminal modules with JavaScript MIME type", async 
   assert.match(source, /Terminal/);
 });
 
-test("API stores model settings in sqlite and exposes runtime status", async () => {
+test("API stores model settings locally and exposes runtime status", async () => {
   const app = await createTestApp({ knowledgeRoot: await createKnowledgeFixture(), env: {} });
 
   const saved = await request(app, "/api/settings/model", {
@@ -484,6 +484,49 @@ test("API stores model settings in sqlite and exposes runtime status", async () 
   assert.equal(status.response.status, 200);
   assert.equal(status.json.settings.model, "deepseek-v4-flash");
   assert.equal(status.json.terminal.configured, true);
+});
+
+test("settings store persists locally without a system sqlite3 binary", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "course-json-settings-"));
+  const store = await new SettingsStore({
+    projectRoot: root,
+    sqlitePath: path.join(root, "missing-sqlite3"),
+    env: {},
+  }).init();
+
+  await store.saveModelSettings({
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-v4-flash",
+    apiKey: "sk-json-store-secret",
+  });
+  await store.updateKnowledgeModule("module-a", { title: "模块 A", sortOrder: 2 });
+  await store.updateKnowledgePage("page-a", { moduleId: "module-a", title: "课件 A", sortOrder: 1 });
+  await store.appendChatMessage("page-a", { role: "user", content: "你好" });
+  await store.appendChatMessage("page-a", {
+    role: "assistant",
+    content: "你好，我是赋范智能体。",
+    answerHtml: "<p>你好</p>",
+    sources: [{ id: "page-a", title: "课件 A" }],
+  });
+
+  const reloaded = await new SettingsStore({
+    projectRoot: root,
+    sqlitePath: path.join(root, "missing-sqlite3"),
+    env: {},
+  }).init();
+
+  const settings = await reloaded.getModelSettings();
+  const catalog = await reloaded.getKnowledgeCatalog();
+  const messages = await reloaded.getChatMessages("page-a");
+
+  assert.equal(settings.apiKey, "sk-json-store-secret");
+  assert.equal(catalog.modules[0].title, "模块 A");
+  assert.equal(catalog.pages[0].title, "课件 A");
+  assert.equal(messages.length, 2);
+  assert.equal(messages[1].answerHtml, "<p>你好</p>");
+  assert.deepEqual(messages[1].sources, [{ id: "page-a", title: "课件 A" }]);
+  assert.equal(await pathExists(path.join(root, "data", "settings.json")), true);
 });
 
 test("API persists successful model connection tests for status rendering", async () => {
@@ -563,4 +606,13 @@ async function createTestApp(options = {}) {
 async function createTestSettingsStore(env = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "course-settings-"));
   return new SettingsStore({ projectRoot: root, env }).init();
+}
+
+async function pathExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }

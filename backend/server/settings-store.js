@@ -1,75 +1,27 @@
-import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
 
 const DEFAULT_PROVIDER = "deepseek";
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
 const DEFAULT_MODEL = "deepseek-v4-flash";
-
 const MODEL_KEYS = ["provider", "baseUrl", "model", "apiKey"];
 const MODEL_TEST_KEY = "modelTest";
 
 export class SettingsStore {
   constructor({ projectRoot, dbPath, sqlitePath = "sqlite3", env = process.env } = {}) {
     this.projectRoot = projectRoot || process.cwd();
-    this.dbPath = path.resolve(dbPath || path.join(this.projectRoot, "data", "settings.sqlite"));
+    this.storePath = resolveStorePath({ projectRoot: this.projectRoot, dbPath });
+    this.dbPath = this.storePath;
     this.sqlitePath = sqlitePath;
     this.env = env;
     this.ready = false;
+    this.data = createEmptyStore();
   }
 
   async init() {
-    await fs.mkdir(path.dirname(this.dbPath), { recursive: true });
-    await this.exec(`
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    await this.exec(`
-      CREATE TABLE IF NOT EXISTS knowledge_modules (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        sort_order INTEGER,
-        deleted_at TEXT,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    await this.exec(`
-      CREATE TABLE IF NOT EXISTS knowledge_pages (
-        id TEXT PRIMARY KEY,
-        module_id TEXT,
-        title TEXT,
-        sort_order INTEGER,
-        deleted_at TEXT,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    await this.exec(`
-      CREATE TABLE IF NOT EXISTS chat_sessions (
-        id TEXT PRIMARY KEY,
-        page_id TEXT NOT NULL UNIQUE,
-        title TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    await this.exec(`
-      CREATE TABLE IF NOT EXISTS chat_messages (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        answer_html TEXT,
-        sources_json TEXT,
-        created_at TEXT NOT NULL
-      );
-    `);
+    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
+    this.data = await this.loadStore();
     this.ready = true;
     await this.seedFromEnvIfNeeded();
     return this;
@@ -77,26 +29,20 @@ export class SettingsStore {
 
   async getModelSettings() {
     await this.ensureReady();
-    const rows = await this.queryJson(
-      `SELECT key, value, updated_at AS updatedAt FROM settings WHERE key IN (${MODEL_KEYS.map(sqlString).join(", ")})`,
-    );
-    const saved = Object.fromEntries(rows.map((row) => [row.key, row]));
+    const saved = this.data.settings || {};
     const fromEnv = {
       provider: this.env.DEEPSEEK_PROVIDER || this.env.CODEWHALE_PROVIDER || DEFAULT_PROVIDER,
       baseUrl: this.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
       model: this.env.DEEPSEEK_MODEL || DEFAULT_MODEL,
       apiKey: this.env.DEEPSEEK_API_KEY || "",
     };
-
-    const settings = {
+    return normalizeModelSettings({
       provider: saved.provider?.value || fromEnv.provider,
       baseUrl: saved.baseUrl?.value || fromEnv.baseUrl,
       model: saved.model?.value || fromEnv.model,
       apiKey: saved.apiKey?.value || fromEnv.apiKey,
-      updatedAt: latestUpdatedAt(rows),
-    };
-
-    return normalizeModelSettings(settings);
+      updatedAt: latestUpdatedAt(Object.values(saved)),
+    });
   }
 
   async saveModelSettings(payload = {}) {
@@ -111,32 +57,22 @@ export class SettingsStore {
     const now = new Date().toISOString();
 
     for (const key of MODEL_KEYS) {
-      await this.exec(
-        [
-          "INSERT INTO settings(key, value, updated_at)",
-          `VALUES (${sqlString(key)}, ${sqlString(next[key])}, ${sqlString(now)})`,
-          "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;",
-        ].join(" "),
-      );
+      this.data.settings[key] = {
+        value: next[key],
+        updatedAt: now,
+      };
     }
-
-    await this.clearModelTestResult();
+    delete this.data.settings[MODEL_TEST_KEY];
+    await this.persist();
     return { ...next, updatedAt: now };
   }
 
   async getModelTestResult(currentSettings) {
     await this.ensureReady();
-    const rows = await this.queryJson(`SELECT value FROM settings WHERE key = ${sqlString(MODEL_TEST_KEY)} LIMIT 1`);
-    if (!rows.length) return null;
-
-    try {
-      const result = JSON.parse(rows[0].value);
-      if (!result?.signature) return null;
-      if (currentSettings && result.signature !== this.modelSettingsSignature(currentSettings)) return null;
-      return result;
-    } catch {
-      return null;
-    }
+    const saved = this.data.settings?.[MODEL_TEST_KEY]?.value;
+    if (!saved?.signature) return null;
+    if (currentSettings && saved.signature !== this.modelSettingsSignature(currentSettings)) return null;
+    return saved;
   }
 
   async saveModelTestResult({ llm, settings }) {
@@ -156,73 +92,58 @@ export class SettingsStore {
       },
     };
 
-    await this.exec(
-      [
-        "INSERT INTO settings(key, value, updated_at)",
-        `VALUES (${sqlString(MODEL_TEST_KEY)}, ${sqlString(JSON.stringify(value))}, ${sqlString(now)})`,
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;",
-      ].join(" "),
-    );
+    this.data.settings[MODEL_TEST_KEY] = { value, updatedAt: now };
+    await this.persist();
     return value;
   }
 
   async clearModelTestResult() {
     await this.ensureReady();
-    await this.exec(`DELETE FROM settings WHERE key = ${sqlString(MODEL_TEST_KEY)}`);
+    delete this.data.settings[MODEL_TEST_KEY];
+    await this.persist();
   }
 
   async getKnowledgeCatalog() {
     await this.ensureReady();
-    const [modules, pages] = await Promise.all([
-      this.queryJson("SELECT id, title, sort_order AS sortOrder, deleted_at AS deletedAt FROM knowledge_modules"),
-      this.queryJson("SELECT id, module_id AS moduleId, title, sort_order AS sortOrder, deleted_at AS deletedAt FROM knowledge_pages"),
-    ]);
-    return { modules, pages };
+    return {
+      modules: Object.values(this.data.knowledgeModules || {}),
+      pages: Object.values(this.data.knowledgePages || {}),
+    };
   }
 
   async updateKnowledgeModule(id, payload = {}) {
     await this.ensureReady();
     const moduleId = normalizeId(id);
     const now = new Date().toISOString();
-    const current = await this.getKnowledgeModule(moduleId);
+    const current = this.data.knowledgeModules[moduleId] || null;
     const next = {
+      id: moduleId,
       title: Object.prototype.hasOwnProperty.call(payload, "title") ? normalizeOptionalText(payload.title) : current?.title || null,
       sortOrder: Object.prototype.hasOwnProperty.call(payload, "sortOrder") ? normalizeOptionalInteger(payload.sortOrder) : current?.sortOrder ?? null,
       deletedAt: Object.prototype.hasOwnProperty.call(payload, "deletedAt") ? payload.deletedAt : current?.deletedAt || null,
+      updatedAt: now,
     };
-
-    await this.exec(
-      [
-        "INSERT INTO knowledge_modules(id, title, sort_order, deleted_at, updated_at)",
-        `VALUES (${sqlString(moduleId)}, ${sqlString(next.title)}, ${sqlValue(next.sortOrder)}, ${sqlString(next.deletedAt)}, ${sqlString(now)})`,
-        "ON CONFLICT(id) DO UPDATE SET",
-        "title = excluded.title, sort_order = excluded.sort_order, deleted_at = excluded.deleted_at, updated_at = excluded.updated_at;",
-      ].join(" "),
-    );
-    return { id: moduleId, ...next, updatedAt: now };
+    this.data.knowledgeModules[moduleId] = next;
+    await this.persist();
+    return next;
   }
 
   async updateKnowledgePage(id, payload = {}) {
     await this.ensureReady();
     const pageId = normalizeId(id);
     const now = new Date().toISOString();
-    const current = await this.getKnowledgePage(pageId);
+    const current = this.data.knowledgePages[pageId] || null;
     const next = {
+      id: pageId,
       moduleId: Object.prototype.hasOwnProperty.call(payload, "moduleId") ? normalizeOptionalText(payload.moduleId) : current?.moduleId || null,
       title: Object.prototype.hasOwnProperty.call(payload, "title") ? normalizeOptionalText(payload.title) : current?.title || null,
       sortOrder: Object.prototype.hasOwnProperty.call(payload, "sortOrder") ? normalizeOptionalInteger(payload.sortOrder) : current?.sortOrder ?? null,
       deletedAt: Object.prototype.hasOwnProperty.call(payload, "deletedAt") ? payload.deletedAt : current?.deletedAt || null,
+      updatedAt: now,
     };
-
-    await this.exec(
-      [
-        "INSERT INTO knowledge_pages(id, module_id, title, sort_order, deleted_at, updated_at)",
-        `VALUES (${sqlString(pageId)}, ${sqlString(next.moduleId)}, ${sqlString(next.title)}, ${sqlValue(next.sortOrder)}, ${sqlString(next.deletedAt)}, ${sqlString(now)})`,
-        "ON CONFLICT(id) DO UPDATE SET",
-        "module_id = excluded.module_id, title = excluded.title, sort_order = excluded.sort_order, deleted_at = excluded.deleted_at, updated_at = excluded.updated_at;",
-      ].join(" "),
-    );
-    return { id: pageId, ...next, updatedAt: now };
+    this.data.knowledgePages[pageId] = next;
+    await this.persist();
+    return next;
   }
 
   async reorderKnowledge({ modules = [], pages = [] } = {}) {
@@ -257,51 +178,33 @@ export class SettingsStore {
     const session = await this.getChatSessionByPageId(pageId);
     if (!session) return [];
     const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 200));
-    const rows = await this.queryJson(
-      [
-        "SELECT id, role, content, answer_html AS answerHtml, sources_json AS sourcesJson, created_at AS createdAt",
-        "FROM chat_messages",
-        `WHERE session_id = ${sqlString(session.id)}`,
-        "ORDER BY created_at DESC",
-        `LIMIT ${safeLimit}`,
-      ].join(" "),
-    );
-    return rows.reverse().map((row) => ({
-      id: row.id,
-      role: row.role,
-      content: row.content,
-      answerHtml: row.answerHtml || "",
-      sources: parseJsonArray(row.sourcesJson),
-      createdAt: row.createdAt,
-    }));
+    return this.data.chatMessages
+      .filter((message) => message.sessionId === session.id)
+      .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)))
+      .slice(-safeLimit)
+      .map(publicChatMessage);
   }
 
   async appendChatMessage(pageId, message = {}) {
     await this.ensureReady();
     const session = await this.ensureChatSession(pageId, message.title || "");
-    const now = new Date().toISOString();
-    const id = crypto.randomUUID();
-    const role = message.role === "assistant" ? "assistant" : "user";
     const content = String(message.content || "").trim();
     if (!content) return null;
-    await this.exec(
-      [
-        "INSERT INTO chat_messages(id, session_id, role, content, answer_html, sources_json, created_at)",
-        "VALUES (",
-        [
-          sqlString(id),
-          sqlString(session.id),
-          sqlString(role),
-          sqlString(content),
-          sqlString(message.answerHtml || ""),
-          sqlString(JSON.stringify(Array.isArray(message.sources) ? message.sources : [])),
-          sqlString(now),
-        ].join(", "),
-        ");",
-      ].join(" "),
-    );
-    await this.exec(`UPDATE chat_sessions SET updated_at = ${sqlString(now)} WHERE id = ${sqlString(session.id)}`);
-    return { id, role, content, answerHtml: message.answerHtml || "", sources: message.sources || [], createdAt: now };
+
+    const now = new Date().toISOString();
+    const entry = {
+      id: crypto.randomUUID(),
+      sessionId: session.id,
+      role: message.role === "assistant" ? "assistant" : "user",
+      content,
+      answerHtml: message.answerHtml || "",
+      sources: Array.isArray(message.sources) ? message.sources : [],
+      createdAt: now,
+    };
+    this.data.chatMessages.push(entry);
+    this.data.chatSessions[session.id] = { ...session, updatedAt: now };
+    await this.persist();
+    return publicChatMessage(entry);
   }
 
   modelSettingsSignature(settings = {}) {
@@ -346,45 +249,43 @@ export class SettingsStore {
   }
 
   async getKnowledgeModule(id) {
-    const rows = await this.queryJson(
-      `SELECT id, title, sort_order AS sortOrder, deleted_at AS deletedAt FROM knowledge_modules WHERE id = ${sqlString(id)} LIMIT 1`,
-    );
-    return rows[0] || null;
+    await this.ensureReady();
+    return this.data.knowledgeModules[normalizeId(id)] || null;
   }
 
   async getKnowledgePage(id) {
-    const rows = await this.queryJson(
-      `SELECT id, module_id AS moduleId, title, sort_order AS sortOrder, deleted_at AS deletedAt FROM knowledge_pages WHERE id = ${sqlString(id)} LIMIT 1`,
-    );
-    return rows[0] || null;
+    await this.ensureReady();
+    return this.data.knowledgePages[normalizeId(id)] || null;
   }
 
   async getChatSessionByPageId(pageId) {
-    const rows = await this.queryJson(
-      `SELECT id, page_id AS pageId, title, created_at AS createdAt, updated_at AS updatedAt FROM chat_sessions WHERE page_id = ${sqlString(pageId)} LIMIT 1`,
-    );
-    return rows[0] || null;
+    await this.ensureReady();
+    const normalizedPageId = normalizeId(pageId);
+    return Object.values(this.data.chatSessions).find((session) => session.pageId === normalizedPageId) || null;
   }
 
   async ensureChatSession(pageId, title = "") {
+    await this.ensureReady();
     const normalizedPageId = normalizeId(pageId);
     const existing = await this.getChatSessionByPageId(normalizedPageId);
     if (existing) return existing;
+
     const now = new Date().toISOString();
-    const id = `chat-${crypto.randomUUID()}`;
-    await this.exec(
-      [
-        "INSERT INTO chat_sessions(id, page_id, title, created_at, updated_at)",
-        `VALUES (${sqlString(id)}, ${sqlString(normalizedPageId)}, ${sqlString(title)}, ${sqlString(now)}, ${sqlString(now)})`,
-      ].join(" "),
-    );
-    return { id, pageId: normalizedPageId, title, createdAt: now, updatedAt: now };
+    const session = {
+      id: `chat-${crypto.randomUUID()}`,
+      pageId: normalizedPageId,
+      title,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.data.chatSessions[session.id] = session;
+    await this.persist();
+    return session;
   }
 
   async seedFromEnvIfNeeded() {
     if (!this.env.DEEPSEEK_API_KEY) return;
-    const rows = await this.queryJson("SELECT key FROM settings WHERE key = 'apiKey' LIMIT 1");
-    if (rows.length) return;
+    if (this.data.settings.apiKey?.value) return;
     await this.saveModelSettings({
       provider: this.env.DEEPSEEK_PROVIDER || this.env.CODEWHALE_PROVIDER || DEFAULT_PROVIDER,
       baseUrl: this.env.DEEPSEEK_BASE_URL || DEFAULT_BASE_URL,
@@ -393,14 +294,21 @@ export class SettingsStore {
     });
   }
 
-  async exec(sql) {
-    await execFileAsync(this.sqlitePath, [this.dbPath, sql], { timeout: 10_000 });
+  async loadStore() {
+    try {
+      const text = await fs.readFile(this.storePath, "utf8");
+      return normalizeStore(JSON.parse(text));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      return createEmptyStore();
+    }
   }
 
-  async queryJson(sql) {
-    const { stdout } = await execFileAsync(this.sqlitePath, ["-json", this.dbPath, sql], { timeout: 10_000 });
-    const text = stdout.trim();
-    return text ? JSON.parse(text) : [];
+  async persist() {
+    const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
+    await fs.writeFile(tempPath, `${JSON.stringify(normalizeStore(this.data), null, 2)}\n`, "utf8");
+    await fs.rename(tempPath, this.storePath);
   }
 }
 
@@ -421,17 +329,79 @@ export function maskSecret(value) {
   return `${text.slice(0, 5)}***${text.slice(-4)}`;
 }
 
+function resolveStorePath({ projectRoot, dbPath }) {
+  if (dbPath && !String(dbPath).endsWith(".sqlite")) return path.resolve(dbPath);
+  return path.resolve(projectRoot, "data", "settings.json");
+}
+
+function createEmptyStore() {
+  return {
+    version: 1,
+    settings: {},
+    knowledgeModules: {},
+    knowledgePages: {},
+    chatSessions: {},
+    chatMessages: [],
+  };
+}
+
+function normalizeStore(value) {
+  const store = createEmptyStore();
+  if (!value || typeof value !== "object") return store;
+  return {
+    version: 1,
+    settings: normalizeRecordMap(value.settings),
+    knowledgeModules: normalizeEntityMap(value.knowledgeModules),
+    knowledgePages: normalizeEntityMap(value.knowledgePages),
+    chatSessions: normalizeEntityMap(value.chatSessions),
+    chatMessages: Array.isArray(value.chatMessages) ? value.chatMessages.map(normalizeChatMessage).filter(Boolean) : [],
+  };
+}
+
+function normalizeRecordMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).map(([key, record]) => [
+      key,
+      {
+        value: record?.value,
+        updatedAt: record?.updatedAt || null,
+      },
+    ]),
+  );
+}
+
+function normalizeEntityMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry && typeof entry === "object"));
+}
+
+function normalizeChatMessage(message) {
+  if (!message || typeof message !== "object" || !message.id || !message.sessionId || !message.content) return null;
+  return {
+    id: String(message.id),
+    sessionId: String(message.sessionId),
+    role: message.role === "assistant" ? "assistant" : "user",
+    content: String(message.content),
+    answerHtml: String(message.answerHtml || ""),
+    sources: Array.isArray(message.sources) ? message.sources : [],
+    createdAt: message.createdAt || new Date().toISOString(),
+  };
+}
+
+function publicChatMessage(message) {
+  return {
+    id: message.id,
+    role: message.role,
+    content: message.content,
+    answerHtml: message.answerHtml || "",
+    sources: Array.isArray(message.sources) ? message.sources : [],
+    createdAt: message.createdAt,
+  };
+}
+
 function latestUpdatedAt(rows) {
   return rows.map((row) => row.updatedAt).filter(Boolean).sort().at(-1) || null;
-}
-
-function sqlString(value) {
-  return `'${String(value ?? "").replaceAll("'", "''")}'`;
-}
-
-function sqlValue(value) {
-  if (value === null || value === undefined || value === "") return "NULL";
-  return Number.isFinite(Number(value)) ? String(Number(value)) : "NULL";
 }
 
 function normalizeId(value) {
@@ -449,13 +419,4 @@ function normalizeOptionalInteger(value) {
   if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
   return Number.isFinite(number) ? Math.trunc(number) : null;
-}
-
-function parseJsonArray(value) {
-  try {
-    const parsed = JSON.parse(value || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
 }

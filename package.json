@@ -8,7 +8,7 @@
     "dev": "node backend/server/index.js",
     "test": "node --test backend/tests/*.test.js",
     "check": "npm test",
-    "runtime:build": "cargo build --manifest-path vendor/codewhale-edu/Cargo.toml --package codewhale-tui --bin codewhale-tui --release",
+    "runtime:build": "node scripts/build-runtime.mjs",
     "release:smoke": "node scripts/release-smoke.mjs",
     "prepare:desktop": "node scripts/desktop-package.mjs all",
     "prepare:resources": "node scripts/desktop-package.mjs resources",

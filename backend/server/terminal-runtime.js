@@ -14,24 +14,31 @@ const EVENT_HISTORY_LIMIT = 250;
 
 export async function getTerminalRuntimeStatus(projectRoot, env = process.env) {
   const binaryPath = path.resolve(projectRoot, env.CODEWHALE_TUI_BINARY || defaultTuiRuntimePath());
+  const bridgePath = path.resolve(projectRoot, env.FUFAN_PTY_BRIDGE_BINARY || defaultPtyBridgeRuntimePath());
   try {
-    const stat = await fs.stat(binaryPath);
+    const [tuiStat, bridgeStat] = await Promise.all([fs.stat(binaryPath), fs.stat(bridgePath)]);
     return {
-      available: stat.isFile(),
+      available: tuiStat.isFile() && bridgeStat.isFile(),
       kind: "codewhale-tui",
       binaryPath,
+      bridgePath,
     };
   } catch {
     return {
       available: false,
       kind: "codewhale-tui",
       binaryPath,
+      bridgePath,
     };
   }
 }
 
 export function defaultTuiRuntimePath(platform = process.platform) {
   return path.join("runtime", "bin", platform === "win32" ? "codewhale-tui.exe" : "codewhale-tui");
+}
+
+export function defaultPtyBridgeRuntimePath(platform = process.platform) {
+  return path.join("runtime", "bin", platform === "win32" ? "fufan-pty-bridge.exe" : "fufan-pty-bridge");
 }
 
 export async function buildTerminalLaunch({
@@ -90,14 +97,8 @@ export async function buildTerminalLaunch({
   const resizeControlFile = path.join(codewhaleHome, `pty-resize-${crypto.randomUUID()}.json`);
 
   return {
-    command: env.PYTHON || env.PYTHON3 || "python3",
-    args: [
-      path.join(projectRoot, "server", "pty_bridge.py"),
-      runtime.binaryPath,
-      String(size.cols),
-      String(size.rows),
-      resizeControlFile,
-    ],
+    command: runtime.bridgePath,
+    args: [runtime.binaryPath, String(size.cols), String(size.rows), resizeControlFile],
     cwd: pack.absolutePath,
     env: terminalEnv,
     pack,
@@ -313,13 +314,6 @@ class TerminalSession {
     if (!this.launch.resizeControlFile) return;
 
     await fs.writeFile(this.launch.resizeControlFile, JSON.stringify(next), "utf8");
-    if (process.platform !== "win32" && this.child.pid) {
-      try {
-        this.child.kill("SIGUSR1");
-      } catch {
-        // The process may have exited between the API request and signal delivery.
-      }
-    }
     this.emit({ type: "resize", cols: next.cols, rows: next.rows, session: this.summary() });
   }
 

@@ -1,8 +1,10 @@
 backend/data/*.sqlite
 backend/data/*.sqlite-*
+backend/data/settings.json
 backend/knowledge/generated/
 backend/knowledge/source-registry.json
 backend/runtime/bin/codewhale-tui*
+backend/runtime/bin/fufan-pty-bridge*
 !backend/runtime/bin/.gitkeep
 backend/runtime-packs/**/.codewhale-home/
 backend/runtime-packs/**/.course-session/

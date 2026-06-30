@@ -41,6 +41,10 @@ export function tuiBinaryNameForTarget(targetTriple) {
   return targetTriple.includes("windows") ? "codewhale-tui.exe" : "codewhale-tui";
 }
 
+export function ptyBridgeBinaryNameForTarget(targetTriple) {
+  return targetTriple.includes("windows") ? "fufan-pty-bridge.exe" : "fufan-pty-bridge";
+}
+
 export async function detectTargetTriple() {
   if (process.env.TAURI_TARGET_TRIPLE) return process.env.TAURI_TARGET_TRIPLE;
   try {
@@ -59,13 +63,14 @@ export async function copyDesktopResources({
 } = {}) {
   const triple = targetTriple || (await detectTargetTriple());
   const tuiRuntime = await resolveTuiRuntimeBinary({ projectRoot, targetTriple: triple, env });
+  const ptyBridgeRuntime = await resolvePtyBridgeRuntimeBinary({ projectRoot, targetTriple: triple, env });
   await fs.rm(stagingRoot, { recursive: true, force: true });
   await fs.mkdir(path.join(stagingRoot, "backend", "runtime", "bin"), { recursive: true });
 
   await copyRequiredDirectory(path.join(projectRoot, "frontend"), path.join(stagingRoot, "frontend"));
   await copyRequiredDirectory(path.join(projectRoot, "backend", "server"), path.join(stagingRoot, "backend", "server"));
   await copyRequiredDirectory(path.join(projectRoot, "backend", "knowledge"), path.join(stagingRoot, "backend", "knowledge"));
-  await copyRequiredDirectory(
+  await copyRuntimePackDirectory(
     path.join(projectRoot, "backend", "runtime-packs"),
     path.join(stagingRoot, "backend", "runtime-packs"),
   );
@@ -73,12 +78,17 @@ export async function copyDesktopResources({
   const tuiTarget = path.join(stagingRoot, "backend", "runtime", "bin", tuiRuntime.targetName);
   await fs.copyFile(tuiRuntime.sourcePath, tuiTarget);
   await fs.chmod(tuiTarget, 0o755).catch(() => {});
+  const ptyBridgeTarget = path.join(stagingRoot, "backend", "runtime", "bin", ptyBridgeRuntime.targetName);
+  await fs.copyFile(ptyBridgeRuntime.sourcePath, ptyBridgeTarget);
+  await fs.chmod(ptyBridgeTarget, 0o755).catch(() => {});
 
   return {
     stagingRoot,
     targetTriple: triple,
     tuiSource: tuiRuntime.sourcePath,
     tuiTarget,
+    ptyBridgeSource: ptyBridgeRuntime.sourcePath,
+    ptyBridgeTarget,
     backendDataIncluded: await pathExists(path.join(stagingRoot, "backend", "data")),
   };
 }
@@ -104,6 +114,37 @@ export async function resolveTuiRuntimeBinary({
         `Missing FuFan Agent runtime binary for ${targetName}.`,
         `Checked: ${candidates.join(", ")}`,
         "Build it with npm run runtime:build or provide CODEWHALE_TUI_BINARY=/path/to/codewhale-tui.",
+      ].join(" "),
+    );
+  }
+
+  return {
+    sourcePath,
+    targetName,
+  };
+}
+
+export async function resolvePtyBridgeRuntimeBinary({
+  projectRoot = defaultProjectRoot,
+  targetTriple,
+  env = process.env,
+} = {}) {
+  const targetName = ptyBridgeBinaryNameForTarget(targetTriple || (await detectTargetTriple()));
+  const configured = env.FUFAN_PTY_BRIDGE_BINARY;
+  const candidates = configured
+    ? [path.resolve(projectRoot, configured)]
+    : [
+        path.join(projectRoot, "backend", "runtime", "bin", targetName),
+        path.join(projectRoot, "target", "release", targetName),
+      ];
+  const sourcePath = await firstExistingPath(candidates);
+
+  if (!sourcePath) {
+    throw new Error(
+      [
+        `Missing FuFan PTY bridge runtime binary for ${targetName}.`,
+        `Checked: ${candidates.join(", ")}`,
+        "Build it with npm run runtime:build or provide FUFAN_PTY_BRIDGE_BINARY=/path/to/fufan-pty-bridge.",
       ].join(" "),
     );
   }
@@ -190,6 +231,12 @@ export async function checkDesktopEnvironment({
       ),
       label: `FuFan Agent runtime (${triple})`,
     },
+    ptyBridgeRuntime: {
+      ok: await pathExists(
+        path.join(projectRoot, "src-tauri", "resources", "backend", "runtime", "bin", ptyBridgeBinaryNameForTarget(triple)),
+      ),
+      label: `FuFan PTY bridge (${triple})`,
+    },
     nodeSidecar: {
       ok: await pathExists(path.join(projectRoot, "src-tauri", "binaries", sidecarBinaryName("fufan-node", triple))),
       label: `Node sidecar (${triple})`,
@@ -203,7 +250,7 @@ export async function checkDesktopEnvironment({
   if (!checks.tauriCli.ok) {
     nextSteps.push("Run npm install to install @tauri-apps/cli, or install a compatible Tauri CLI globally.");
   }
-  if (!checks.resources.ok || !checks.tuiRuntime.ok || !checks.nodeSidecar.ok) {
+  if (!checks.resources.ok || !checks.tuiRuntime.ok || !checks.ptyBridgeRuntime.ok || !checks.nodeSidecar.ok) {
     nextSteps.push("Run npm run prepare:desktop to stage resources and prepare the Node sidecar.");
   }
 
@@ -234,6 +281,34 @@ async function copyRequiredDirectory(source, target) {
     throw new Error(`Missing required desktop resource: ${source}`);
   }
   await fs.cp(source, target, { recursive: true, force: true });
+}
+
+async function copyRuntimePackDirectory(source, target) {
+  if (!(await pathExists(source))) {
+    throw new Error(`Missing required desktop resource: ${source}`);
+  }
+  await fs.rm(target, { recursive: true, force: true });
+  await fs.mkdir(target, { recursive: true });
+  await copyDirectoryFiltered(source, target, {
+    excludeNames: new Set([".codewhale-home", ".course-session", ".deepseek", ".codewhale", "exports"]),
+  });
+}
+
+async function copyDirectoryFiltered(source, target, { excludeNames }) {
+  await fs.mkdir(target, { recursive: true });
+  const entries = await fs.readdir(source, { withFileTypes: true });
+  for (const entry of entries) {
+    if (excludeNames.has(entry.name)) continue;
+    const sourcePath = path.join(source, entry.name);
+    const targetPath = path.join(target, entry.name);
+    if (entry.isDirectory()) {
+      await copyDirectoryFiltered(sourcePath, targetPath, { excludeNames });
+    } else if (entry.isFile()) {
+      await fs.copyFile(sourcePath, targetPath);
+      const stat = await fs.stat(sourcePath).catch(() => null);
+      if (stat) await fs.chmod(targetPath, stat.mode).catch(() => {});
+    }
+  }
 }
 
 async function commandExists(command) {

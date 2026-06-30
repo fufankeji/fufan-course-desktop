@@ -4,10 +4,19 @@ version = "0.1.0"
 description = "赋范空间大模型学习平台桌面版"
 authors = ["FuFan"]
 edition = "2021"
+default-run = "fufan_course_desktop"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+anyhow = "1"
+portable-pty = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+
+[[bin]]
+name = "fufan-pty-bridge"
+path = "src/pty_bridge.rs"
