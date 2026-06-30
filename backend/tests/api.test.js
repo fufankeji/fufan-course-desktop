@@ -310,6 +310,18 @@ test("frontend opens a required model config modal when no API key is stored", a
   assert.match(source, /state\.modelConfigRequired/);
 });
 
+test("frontend closes the model config modal after a normal save succeeds", async () => {
+  const source = await fs.readFile(path.resolve(import.meta.dirname, "../../frontend/app.js"), "utf8");
+  const start = source.indexOf("async function handleModelConfigSave");
+  const end = source.indexOf("async function verifyAndSaveRequiredModelConfig", start);
+  const saveHandler = source.slice(start, end);
+
+  assert.ok(start >= 0);
+  assert.ok(end > start);
+  assert.match(saveHandler, /fetchJson\("\/api\/settings\/model"/);
+  assert.match(saveHandler, /closeModelConfig\(\)/);
+});
+
 test("frontend gates TUI launch only when the app has no stored model key", async () => {
   const source = await fs.readFile(path.resolve(import.meta.dirname, "../../frontend/app.js"), "utf8");
 

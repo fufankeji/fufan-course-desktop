@@ -221,6 +221,38 @@ test("windows sidecar preparation accepts a node.exe input", async () => {
   assert.equal(await fs.readFile(result.targetPath, "utf8"), "MZ fake windows executable");
 });
 
+test("desktop build workflow validates Windows NSIS artifacts on a Windows runner", async () => {
+  const workflow = await fs.readFile(path.resolve(".github", "workflows", "desktop-build.yml"), "utf8");
+
+  assert.match(workflow, /build-windows:/);
+  assert.match(workflow, /runs-on:\s*windows-2022/);
+  assert.match(workflow, /TAURI_TARGET_TRIPLE:\s*x86_64-pc-windows-msvc/);
+  assert.match(workflow, /choco install nsis -y --no-progress/);
+  assert.match(workflow, /npm ci --no-audit --no-fund/);
+  assert.match(workflow, /npm run runtime:build/);
+  assert.match(workflow, /npm run prepare:desktop/);
+  assert.match(workflow, /npm run desktop:doctor/);
+  assert.match(workflow, /npm run desktop:build:win/);
+  assert.match(workflow, /path:\s*src-tauri\/target\/release\/bundle\/nsis\/\*\.exe/);
+  assert.match(workflow, /if-no-files-found:\s*error/);
+
+  assert.ok(workflow.indexOf("npm run runtime:build") < workflow.indexOf("npm run desktop:build:win"));
+  assert.ok(workflow.indexOf("npm run desktop:doctor") < workflow.indexOf("npm run desktop:build:win"));
+});
+
+test("desktop build workflow validates macOS DMG artifacts before upload", async () => {
+  const workflow = await fs.readFile(path.resolve(".github", "workflows", "desktop-build.yml"), "utf8");
+
+  assert.match(workflow, /build-macos:/);
+  assert.match(workflow, /runs-on:\s*macos-14/);
+  assert.match(workflow, /npm ci --no-audit --no-fund/);
+  assert.match(workflow, /npm run release:smoke/);
+  assert.match(workflow, /npm run desktop:doctor/);
+  assert.match(workflow, /npm run desktop:build:mac/);
+  assert.match(workflow, /path:\s*src-tauri\/target\/release\/bundle\/dmg\/\*\.dmg/);
+  assert.match(workflow, /if-no-files-found:\s*error/);
+});
+
 async function pathExists(filePath) {
   try {
     await fs.access(filePath);

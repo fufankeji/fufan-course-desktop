@@ -88,5 +88,6 @@ src-tauri/target/release/bundle/dmg/赋范空间大模型学习平台_0.1.0_aarc
 
 macOS 正式分发 DMG 需要 Apple Developer 证书与 notarization；Windows 正式分发建议做代码签名，避免 SmartScreen 警告。
 Windows 构建机说明见 [docs/windows-build.md](docs/windows-build.md)。
+如果没有 Windows 电脑，可以在 GitHub Actions 中手动触发 `FuFan Course Desktop Build`，由 `windows-2022` runner 生成 NSIS `.exe` artifact。
 
 注意：`backend/data/settings.sqlite` 是本机运行时生成的配置数据库，可能包含模型密钥。该目录不会进入 Tauri 资源清单，打包前也不要手动把它复制给学员。

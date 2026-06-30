@@ -80,12 +80,16 @@ export async function buildTerminalLaunch({
   const terminalEnv = {
     ...process.env,
     ...env,
+    PWD: pack.absolutePath,
     TERM: env.TERM || "xterm-256color",
     COLORTERM: env.COLORTERM || "truecolor",
     CODEWHALE_PROVIDER: env.CODEWHALE_PROVIDER || env.DEEPSEEK_PROVIDER || "deepseek",
     DEEPSEEK_PROVIDER: env.DEEPSEEK_PROVIDER || env.CODEWHALE_PROVIDER || "deepseek",
     DEEPSEEK_MODEL: env.DEEPSEEK_MODEL || DEFAULT_MODEL,
     CODEWHALE_MODEL: env.CODEWHALE_MODEL || env.DEEPSEEK_MODEL || DEFAULT_MODEL,
+    DEEPSEEK_ALLOW_SHELL: "true",
+    DEEPSEEK_APPROVAL_POLICY: "auto",
+    DEEPSEEK_SANDBOX_MODE: "workspace-write",
     DEEPSEEK_CONFIG_PATH: configPath,
     CODEWHALE_CONFIG_PATH: configPath,
     CODEWHALE_HOME: codewhaleHome,
@@ -98,7 +102,17 @@ export async function buildTerminalLaunch({
 
   return {
     command: runtime.bridgePath,
-    args: [runtime.binaryPath, String(size.cols), String(size.rows), resizeControlFile],
+    args: [
+      runtime.binaryPath,
+      String(size.cols),
+      String(size.rows),
+      resizeControlFile,
+      "--config",
+      configPath,
+      "--workspace",
+      pack.absolutePath,
+      "--skip-onboarding",
+    ],
     cwd: pack.absolutePath,
     env: terminalEnv,
     pack,
@@ -586,10 +600,14 @@ async function ensureEmbeddedTuiDefaults(configPath, env = process.env) {
   }
 
   const modelSettings = modelSettingsFromEnv(env);
-  let next = upsertRootTomlString(raw, "provider", modelSettings.provider);
+  let next = stripProjectTrustSections(raw);
+  next = upsertRootTomlString(next, "provider", modelSettings.provider);
   next = upsertRootTomlString(next, "base_url", modelSettings.baseUrl);
   next = upsertRootTomlString(next, "default_text_model", modelSettings.model);
   next = upsertRootTomlString(next, "api_key", modelSettings.apiKey);
+  next = upsertRootTomlBoolean(next, "allow_shell", true);
+  next = upsertRootTomlString(next, "approval_policy", "auto");
+  next = upsertRootTomlString(next, "sandbox_mode", "workspace-write");
   next = upsertRootTomlString(next, "sidebar_focus", "hidden");
   next = upsertRootTomlBoolean(next, "show_thinking", false);
   next = upsertRootTomlString(next, "locale", "zh-Hans");
@@ -598,6 +616,31 @@ async function ensureEmbeddedTuiDefaults(configPath, env = process.env) {
   }
 
   await ensureEmbeddedTuiSettings(configPath);
+}
+
+function stripProjectTrustSections(raw) {
+  const text = String(raw || "");
+  if (!text.trim()) return "";
+
+  const lines = text.split(/\r?\n/);
+  const kept = [];
+  let skippingProjectSection = false;
+
+  for (const line of lines) {
+    if (/^\s*\[projects\."/u.test(line)) {
+      skippingProjectSection = true;
+      continue;
+    }
+
+    if (skippingProjectSection && /^\s*\[/.test(line)) {
+      skippingProjectSection = false;
+    }
+
+    if (!skippingProjectSection) kept.push(line);
+  }
+
+  const next = kept.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd();
+  return next ? `${next}\n` : "";
 }
 
 function modelSettingsFromEnv(env = process.env) {

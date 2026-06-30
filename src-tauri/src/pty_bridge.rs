@@ -37,6 +37,7 @@ fn run() -> Result<i32> {
     let cols = parse_size(args.next(), 100);
     let rows = parse_size(args.next(), 30);
     let resize_control_file = args.next().map(PathBuf::from);
+    let child_args: Vec<String> = args.collect();
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -49,6 +50,10 @@ fn run() -> Result<i32> {
         .context("open PTY")?;
 
     let mut command_builder = CommandBuilder::new(command);
+    command_builder.args(child_args);
+    if let Ok(cwd) = env::current_dir() {
+        command_builder.cwd(cwd);
+    }
     for (key, value) in env::vars() {
         command_builder.env(key, value);
     }

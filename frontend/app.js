@@ -1863,6 +1863,7 @@ async function handleModelConfigSave(event) {
       },
     });
     addMessage("assistant", "模型配置已保存。后续课程问答和新打开的智能体控制台都会使用这份配置。");
+    closeModelConfig();
   } catch (error) {
     renderConfigStatus({ llm: { ok: false, message: `保存失败：${error.message}` } });
   } finally {

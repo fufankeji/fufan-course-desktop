@@ -2,6 +2,14 @@
 
 Windows 安装包目标是 NSIS `.exe`。建议在 Windows 构建机上构建，不建议在 macOS 上交叉打包正式包。
 
+推荐交付方式是使用仓库内置的 GitHub Actions 工作流：
+
+```text
+.github/workflows/desktop-build.yml
+```
+
+在 GitHub 页面进入 **Actions → FuFan Course Desktop Build → Run workflow** 后，Windows job 会在 `windows-2022` runner 上构建 `codewhale-tui.exe`、`fufan-pty-bridge.exe`、Windows Node sidecar，并上传 NSIS `.exe` artifact。你不需要自己准备 Windows 电脑；但最终 Windows 安装包仍必须在 Windows runner 或 Windows 构建机上生成并验证。
+
 ## 前置条件
 
 - Windows 10/11 构建机
@@ -13,7 +21,7 @@ Windows 安装包目标是 NSIS `.exe`。建议在 Windows 构建机上构建，
 ## 构建命令
 
 ```powershell
-npm install
+npm ci
 npm run desktop:doctor
 npm run desktop:build:win
 ```
@@ -80,7 +88,15 @@ CI 会先执行：
 cargo build --manifest-path vendor/codewhale-edu/Cargo.toml --package codewhale-tui --bin codewhale-tui --release
 ```
 
-然后通过 `CODEWHALE_TUI_BINARY=vendor/codewhale-edu/target/release/codewhale-tui.exe` 将 Windows 版 FuFan Agent runtime 注入安装包。学员端不需要安装 Rust、Node 或任何开发环境。
+然后运行 `npm run prepare:desktop` 和 `npm run desktop:doctor`，确认安装包里的前端、后端、课程资源、Windows TUI runtime、PTY bridge、Node sidecar 都已就绪。学员端不需要安装 Rust、Node 或任何开发环境。
+
+如果 Windows job 成功，下载 artifact：
+
+```text
+fufan-course-desktop-windows-nsis
+```
+
+其中包含 `src-tauri/target/release/bundle/nsis/*.exe` 生成的安装包。
 
 ## macOS 交叉构建边界
 

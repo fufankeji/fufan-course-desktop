@@ -63,9 +63,20 @@ test("terminal launch config uses the skill pack workspace and DeepSeek env", as
     "30",
     launch.resizeControlFile,
   ]);
+  assert.deepEqual(launch.args.slice(4), [
+    "--config",
+    launch.env.CODEWHALE_CONFIG_PATH,
+    "--workspace",
+    launch.cwd,
+    "--skip-onboarding",
+  ]);
   assert.match(launch.cwd, /runtime-packs\/context-engineering$/);
+  assert.equal(launch.env.PWD, launch.cwd);
   assert.equal(launch.env.DEEPSEEK_API_KEY, "test-key");
   assert.equal(launch.env.DEEPSEEK_MODEL, "deepseek-v4-flash");
+  assert.equal(launch.env.DEEPSEEK_ALLOW_SHELL, "true");
+  assert.equal(launch.env.DEEPSEEK_APPROVAL_POLICY, "auto");
+  assert.equal(launch.env.DEEPSEEK_SANDBOX_MODE, "workspace-write");
   assert.equal(launch.env.CODEWHALE_PROVIDER, "deepseek");
   assert.match(launch.env.DEEPSEEK_CONFIG_PATH, /runtime-packs\/context-engineering\/\.codewhale\/config\.toml$/);
   assert.equal(launch.env.FUFAN_DESKTOP_TUI, "1");
@@ -75,10 +86,18 @@ test("terminal launch config uses the skill pack workspace and DeepSeek env", as
   assert.match(config, /^base_url = "https:\/\/api\.deepseek\.com"$/m);
   assert.match(config, /^default_text_model = "deepseek-v4-flash"$/m);
   assert.match(config, /^api_key = "test-key"$/m);
+  assert.match(config, /^allow_shell = true$/m);
+  assert.match(config, /^approval_policy = "auto"$/m);
+  assert.match(config, /^sandbox_mode = "workspace-write"$/m);
 });
 
 test("terminal launch trusts the current skill pack workspace before starting TUI", async () => {
   const root = await createRuntimeFixture();
+  const configPath = path.join(root, "runtime-packs", "context-engineering", ".codewhale", "config.toml");
+  await fs.appendFile(
+    configPath,
+    '\n[projects."/Users/muyu"]\ntrust_level = "trusted"\n\n[projects."/tmp/old-course"]\ntrust_level = "trusted"\n',
+  );
 
   const launch = await buildTerminalLaunch({
     projectRoot: root,
@@ -92,6 +111,9 @@ test("terminal launch trusts the current skill pack workspace before starting TU
   const config = await fs.readFile(path.join(launch.env.CODEWHALE_HOME, "config.toml"), "utf8");
   assert.ok(config.includes(`[projects."${launch.cwd}"]`));
   assert.match(config, /trust_level = "trusted"/);
+
+  const projectConfig = await fs.readFile(configPath, "utf8");
+  assert.doesNotMatch(projectConfig, /\[projects\."/);
 
   const marker = await fs.stat(path.join(launch.cwd, ".deepseek", "trusted"));
   assert.equal(marker.isFile(), true);
