@@ -69,6 +69,12 @@ test("terminal launch config uses the skill pack workspace and DeepSeek env", as
   assert.equal(launch.env.CODEWHALE_PROVIDER, "deepseek");
   assert.match(launch.env.DEEPSEEK_CONFIG_PATH, /runtime-packs\/context-engineering\/\.codewhale\/config\.toml$/);
   assert.equal(launch.env.FUFAN_DESKTOP_TUI, "1");
+
+  const config = await fs.readFile(launch.env.CODEWHALE_CONFIG_PATH, "utf8");
+  assert.match(config, /^provider = "deepseek"$/m);
+  assert.match(config, /^base_url = "https:\/\/api\.deepseek\.com"$/m);
+  assert.match(config, /^default_text_model = "deepseek-v4-flash"$/m);
+  assert.match(config, /^api_key = "test-key"$/m);
 });
 
 test("terminal launch trusts the current skill pack workspace before starting TUI", async () => {
@@ -155,9 +161,15 @@ test("terminal launch writes current lesson context and builds a skill bootstrap
 
 test("API exposes terminal status and starts sessions through the terminal manager", async () => {
   const started = [];
+  const settingsStore = await createTestSettingsStore({ DEEPSEEK_API_KEY: "test-key" });
+  const settings = await settingsStore.getModelSettings();
+  await settingsStore.saveModelTestResult({
+    settings,
+    llm: { ok: true, provider: "deepseek", model: "deepseek-v4-flash", baseUrl: "https://api.deepseek.com" },
+  });
   const app = await createApp({
     knowledgeRoot: await createKnowledgeFixture(),
-    settingsStore: await createTestSettingsStore({ DEEPSEEK_API_KEY: "test-key" }),
+    settingsStore,
     terminalManager: {
       async status() {
         return { available: true, kind: "codewhale-tui", binaryPath: "/tmp/codewhale-tui" };
@@ -186,6 +198,33 @@ test("API exposes terminal status and starts sessions through the terminal manag
   assert.equal(started[0].skillId, "context-compression");
   assert.equal(started[0].cols, 100);
   assert.equal(started[0].rows, 30);
+});
+
+test("API blocks terminal sessions until the saved model key is verified by the app", async () => {
+  const started = [];
+  const settingsStore = await createTestSettingsStore({ DEEPSEEK_API_KEY: "test-key" });
+  const app = await createApp({
+    knowledgeRoot: await createKnowledgeFixture(),
+    settingsStore,
+    terminalManager: {
+      async status() {
+        return { available: true, kind: "codewhale-tui", binaryPath: "/tmp/codewhale-tui" };
+      },
+      async startSession(options) {
+        started.push(options);
+        return { id: "session-1", packId: options.packId, status: "running" };
+      },
+    },
+  });
+
+  const created = await request(app, "/api/terminal/sessions", {
+    method: "POST",
+    body: { packId: "context-engineering", pageId: "rag-test", skillId: "context-compression" },
+  });
+
+  assert.equal(created.response.status, 409);
+  assert.equal(created.json.error.code, "MODEL_CONFIG_UNVERIFIED");
+  assert.equal(started.length, 0);
 });
 
 test("terminal manager reuses a running session for the same course context", async () => {

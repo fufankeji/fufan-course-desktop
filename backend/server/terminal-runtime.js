@@ -76,7 +76,7 @@ export async function buildTerminalLaunch({
     relativeContextFile: lessonContext?.relativeContextFile,
   });
   const configPath = pack.files.codewhaleConfig;
-  await ensureEmbeddedTuiDefaults(configPath);
+  await ensureEmbeddedTuiDefaults(configPath, env);
   const terminalEnv = {
     ...process.env,
     ...env,
@@ -575,7 +575,7 @@ async function ensureWorkspaceTrusted(workspace, env = process.env) {
   await fs.writeFile(configPath, next, { mode: 0o600 });
 }
 
-async function ensureEmbeddedTuiDefaults(configPath) {
+async function ensureEmbeddedTuiDefaults(configPath, env = process.env) {
   await fs.mkdir(path.dirname(configPath), { recursive: true });
 
   let raw = "";
@@ -585,7 +585,12 @@ async function ensureEmbeddedTuiDefaults(configPath) {
     raw = "";
   }
 
-  let next = upsertRootTomlString(raw, "sidebar_focus", "hidden");
+  const modelSettings = modelSettingsFromEnv(env);
+  let next = upsertRootTomlString(raw, "provider", modelSettings.provider);
+  next = upsertRootTomlString(next, "base_url", modelSettings.baseUrl);
+  next = upsertRootTomlString(next, "default_text_model", modelSettings.model);
+  next = upsertRootTomlString(next, "api_key", modelSettings.apiKey);
+  next = upsertRootTomlString(next, "sidebar_focus", "hidden");
   next = upsertRootTomlBoolean(next, "show_thinking", false);
   next = upsertRootTomlString(next, "locale", "zh-Hans");
   if (next !== raw) {
@@ -593,6 +598,15 @@ async function ensureEmbeddedTuiDefaults(configPath) {
   }
 
   await ensureEmbeddedTuiSettings(configPath);
+}
+
+function modelSettingsFromEnv(env = process.env) {
+  return {
+    provider: String(env.DEEPSEEK_PROVIDER || env.CODEWHALE_PROVIDER || "deepseek").trim() || "deepseek",
+    baseUrl: String(env.DEEPSEEK_BASE_URL || "https://api.deepseek.com").trim().replace(/\/+$/, "") || "https://api.deepseek.com",
+    model: String(env.DEEPSEEK_MODEL || env.CODEWHALE_MODEL || DEFAULT_MODEL).trim() || DEFAULT_MODEL,
+    apiKey: String(env.DEEPSEEK_API_KEY || "").trim(),
+  };
 }
 
 async function ensureEmbeddedTuiSettings(configPath) {

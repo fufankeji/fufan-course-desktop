@@ -152,6 +152,8 @@ async function routeRequest(request, context) {
 
     try {
       const runtimeEnv = await context.getRuntimeEnv();
+      const modelReadyError = await terminalModelReadyError(context);
+      if (modelReadyError) return jsonResponse({ error: modelReadyError }, 409);
       setTerminalEnv(context.terminalManager, runtimeEnv);
       const session = await context.terminalManager.startSession({
         packId: String(payload.packId || "context-engineering"),
@@ -389,6 +391,26 @@ async function terminalStatus(terminalManager, runtimeEnv) {
     configured: Boolean(runtimeEnv.DEEPSEEK_API_KEY),
     model: runtimeEnv.DEEPSEEK_MODEL,
   };
+}
+
+async function terminalModelReadyError(context) {
+  const settings = await context.settingsStore.getModelSettings();
+  if (!settings.apiKey) {
+    return {
+      code: "MODEL_CONFIG_REQUIRED",
+      message: "请先配置并验证 DeepSeek API Key，再打开赋范智能体。",
+    };
+  }
+
+  const lastTest = await context.settingsStore.getModelTestResult(settings);
+  if (!lastTest?.llm?.ok) {
+    return {
+      code: "MODEL_CONFIG_UNVERIFIED",
+      message: "DeepSeek API Key 尚未通过连接测试。请先在模型配置中验证并保存，再打开赋范智能体。",
+    };
+  }
+
+  return null;
 }
 
 function setTerminalEnv(terminalManager, runtimeEnv) {

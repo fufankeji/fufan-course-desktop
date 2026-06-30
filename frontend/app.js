@@ -17,6 +17,7 @@ const state = {
   catalogExpanded: true,
   lastScan: null,
   modelSettings: null,
+  modelLastTest: null,
   modelConfigRequired: false,
   quickToolTab: null,
   selectedCourseText: "",
@@ -195,6 +196,7 @@ async function refreshWikiState(options = {}) {
 async function refreshRuntimeStatus() {
   const [modelPayload, importStatus] = await Promise.all([fetchJson("/api/settings/model"), fetchJson("/api/import/status")]);
   state.modelSettings = modelPayload.settings;
+  state.modelLastTest = modelPayload.lastTest?.llm || null;
   renderTopModelStatus(modelPayload);
 
   if (importStatus.importedSources) {
@@ -480,6 +482,8 @@ async function handleSkillPanelClick(event) {
 }
 
 async function openTerminalPanel(packId, skillId) {
+  if (!(await ensureTerminalModelReady())) return;
+
   const pageId = state.currentPageId;
   const pageTitle = elements.pageTitle.textContent || "当前课件";
   elements.terminalOverlay.classList.remove("hidden");
@@ -534,10 +538,44 @@ async function openTerminalPanel(packId, skillId) {
       state.terminal.xterm?.focus();
     });
   } catch (error) {
+    if (handleTerminalModelConfigError(error)) return;
     elements.terminalStatus.textContent = "异常";
     elements.terminalContext.textContent = "控制台启动失败。";
     writeTerminalLocalLine(`启动失败：${error.message}`);
   }
+}
+
+async function ensureTerminalModelReady() {
+  const payload = await refreshRuntimeStatus();
+  const settings = payload.settings || {};
+  const lastTest = payload.lastTest?.llm || null;
+  if (settings.configured && lastTest?.ok) return true;
+
+  openModelConfig({ required: true, reason: "terminal" });
+  renderConfigStatus({
+    llm: {
+      ok: false,
+      message: settings.configured
+        ? "DeepSeek API Key 尚未通过连接测试。请先验证并保存，再打开赋范智能体。"
+        : "请先配置并验证 DeepSeek API Key，再打开赋范智能体。",
+    },
+    terminal: {
+      ok: false,
+      message: "赋范智能体控制台会读取同一份模型配置，不在 TUI 内单独输入密钥。",
+    },
+  });
+  return false;
+}
+
+function handleTerminalModelConfigError(error) {
+  if (!["MODEL_CONFIG_REQUIRED", "MODEL_CONFIG_UNVERIFIED"].includes(error.code)) return false;
+  elements.terminalOverlay.classList.add("hidden");
+  openModelConfig({ required: true, reason: "terminal" });
+  renderConfigStatus({
+    llm: { ok: false, message: error.message },
+    terminal: { ok: false, message: "赋范智能体控制台会读取同一份模型配置，不在 TUI 内单独输入密钥。" },
+  });
+  return true;
 }
 
 function connectTerminalEvents(sessionId) {
@@ -2163,7 +2201,10 @@ async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error?.message || `HTTP ${response.status}`);
+    const error = new Error(payload.error?.message || `HTTP ${response.status}`);
+    error.code = payload.error?.code || "";
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }
