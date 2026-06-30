@@ -310,11 +310,11 @@ test("frontend opens a required model config modal when no API key is stored", a
   assert.match(source, /state\.modelConfigRequired/);
 });
 
-test("frontend gates TUI launch on the app-level model verification", async () => {
+test("frontend gates TUI launch only when the app has no stored model key", async () => {
   const source = await fs.readFile(path.resolve(import.meta.dirname, "../../frontend/app.js"), "utf8");
 
   assert.match(source, /ensureTerminalModelReady\(\)/);
-  assert.match(source, /MODEL_CONFIG_UNVERIFIED/);
+  assert.match(source, /MODEL_CONFIG_REQUIRED/);
   assert.match(source, /openModelConfig\(\{ required: true/);
   assert.doesNotMatch(source, /DEEPSEEK_API_KEY was rejected/);
 });

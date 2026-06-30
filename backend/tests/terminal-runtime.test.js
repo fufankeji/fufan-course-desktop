@@ -200,7 +200,7 @@ test("API exposes terminal status and starts sessions through the terminal manag
   assert.equal(started[0].rows, 30);
 });
 
-test("API blocks terminal sessions until the saved model key is verified by the app", async () => {
+test("API allows terminal sessions when a model key is stored even before connection testing", async () => {
   const started = [];
   const settingsStore = await createTestSettingsStore({ DEEPSEEK_API_KEY: "test-key" });
   const app = await createApp({
@@ -222,8 +222,35 @@ test("API blocks terminal sessions until the saved model key is verified by the 
     body: { packId: "context-engineering", pageId: "rag-test", skillId: "context-compression" },
   });
 
+  assert.equal(created.response.status, 200);
+  assert.equal(created.json.session.id, "session-1");
+  assert.equal(started.length, 1);
+});
+
+test("API blocks terminal sessions only when no model key is stored", async () => {
+  const started = [];
+  const settingsStore = await createTestSettingsStore({});
+  const app = await createApp({
+    knowledgeRoot: await createKnowledgeFixture(),
+    settingsStore,
+    terminalManager: {
+      async status() {
+        return { available: true, kind: "codewhale-tui", binaryPath: "/tmp/codewhale-tui" };
+      },
+      async startSession(options) {
+        started.push(options);
+        return { id: "session-1", packId: options.packId, status: "running" };
+      },
+    },
+  });
+
+  const created = await request(app, "/api/terminal/sessions", {
+    method: "POST",
+    body: { packId: "context-engineering", pageId: "rag-test", skillId: "context-compression" },
+  });
+
   assert.equal(created.response.status, 409);
-  assert.equal(created.json.error.code, "MODEL_CONFIG_UNVERIFIED");
+  assert.equal(created.json.error.code, "MODEL_CONFIG_REQUIRED");
   assert.equal(started.length, 0);
 });
 

@@ -548,16 +548,13 @@ async function openTerminalPanel(packId, skillId) {
 async function ensureTerminalModelReady() {
   const payload = await refreshRuntimeStatus();
   const settings = payload.settings || {};
-  const lastTest = payload.lastTest?.llm || null;
-  if (settings.configured && lastTest?.ok) return true;
+  if (settings.configured) return true;
 
   openModelConfig({ required: true, reason: "terminal" });
   renderConfigStatus({
     llm: {
       ok: false,
-      message: settings.configured
-        ? "DeepSeek API Key 尚未通过连接测试。请先验证并保存，再打开赋范智能体。"
-        : "请先配置并验证 DeepSeek API Key，再打开赋范智能体。",
+      message: "请先配置 DeepSeek API Key，再打开赋范智能体。",
     },
     terminal: {
       ok: false,
@@ -568,7 +565,7 @@ async function ensureTerminalModelReady() {
 }
 
 function handleTerminalModelConfigError(error) {
-  if (!["MODEL_CONFIG_REQUIRED", "MODEL_CONFIG_UNVERIFIED"].includes(error.code)) return false;
+  if (error.code !== "MODEL_CONFIG_REQUIRED") return false;
   elements.terminalOverlay.classList.add("hidden");
   openModelConfig({ required: true, reason: "terminal" });
   renderConfigStatus({
