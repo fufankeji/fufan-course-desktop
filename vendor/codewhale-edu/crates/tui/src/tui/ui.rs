@@ -232,10 +232,20 @@ fn teaching_sidebar_visible(
     chat_width: u16,
 ) -> bool {
     education_enabled
+        && !embedded_desktop_tui_enabled()
         && chat_width >= TEACHING_SIDEBAR_VISIBLE_MIN_WIDTH
         && state
             .recent()
             .any(|event| event.visibility == crate::education::events::EducationVisibility::Student)
+}
+
+fn embedded_desktop_tui_enabled() -> bool {
+    std::env::var("FUFAN_DESKTOP_TUI")
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 fn split_teaching_sidebar_for_chat_area(

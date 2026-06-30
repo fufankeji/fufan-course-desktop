@@ -8,6 +8,7 @@ export function cleanTerminalTranscript(text, options = {}) {
     .replace(/\r/g, "\n")
     .split(/\n/)
     .map((line) => normalizeTerminalLine(line))
+    .map((line) => stripInlineTerminalChrome(line, submitted))
     .filter(Boolean)
     .filter((line) => !isTerminalChrome(line))
     .filter((line) => !isSubmittedPromptLine(line, submitted));
@@ -40,10 +41,38 @@ function normalizeLine(line) {
   return String(line || "").replace(/\s+/g, " ").trim();
 }
 
+function stripInlineTerminalChrome(line, submitted) {
+  let current = normalizeLine(line);
+  if (!current) return "";
+  if (isTerminalChrome(current)) return "";
+
+  const original = current;
+  const inlineChromePatterns = [
+    /\s+(?:Press Esc\b|Ctrl\+C\b).*$/i,
+    /\s+(?:turn completed|reasoning done|waiting for)\b.*$/i,
+    /\s+(?:esc\s+to\s+)?cancel\s+Repo:\s+.*$/i,
+    /\s+Repo:\s+.*\b(?:tok|live|idle|out|max)\b.*$/i,
+    /\s+Agent\s+\S+\s*[·•].*$/i,
+    /\s+deepseek-v4-flash.*\b(?:tok|live|idle|max|%)\b.*$/i,
+  ];
+
+  for (const pattern of inlineChromePatterns) {
+    current = current.replace(pattern, "").trim();
+  }
+
+  if (current !== original && isSubmittedPromptPrefix(current, submitted)) {
+    return "";
+  }
+
+  return current;
+}
+
 function isTerminalChrome(line) {
   return [
     /^Composer\b/i,
+    /^输入区\b/,
     /^Write a task or use \/\./i,
+    /^编写任务或使用\s*\/。?/,
     /^Agent\s+\S+\s*[·•]/i,
     /^agent\s*[·•]/i,
     /deepseek-v4-flash.*(max|live|tok|idle|%)/i,
@@ -76,6 +105,12 @@ function isSubmittedPromptLine(line, submitted) {
   if (!submitted) return false;
   const normalized = normalizeLine(line);
   return normalized.length >= 8 && submitted.includes(normalized.slice(0, Math.min(40, normalized.length)));
+}
+
+function isSubmittedPromptPrefix(line, submitted) {
+  if (!submitted) return false;
+  const normalized = normalizeLine(line);
+  return normalized.length > 0 && normalized.length <= 8 && submitted.startsWith(normalized);
 }
 
 function dedupeAdjacent(lines) {

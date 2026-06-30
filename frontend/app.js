@@ -1,9 +1,9 @@
-import { terminalInputChunks, terminalSubmitDelayMs } from "./terminal-input.js";
-import { createTerminalScreen } from "./terminal-screen.js";
-import { cleanTerminalTranscript, terminalTurnCompleted } from "./terminal-transcript.js";
+import { FitAddon } from "./vendor/xterm/addon-fit.mjs";
+import { Terminal } from "./vendor/xterm/xterm.mjs";
 
-const TERMINAL_COLS = 96;
-const TERMINAL_ROWS = 32;
+const TERMINAL_FALLBACK_COLS = 100;
+const TERMINAL_FALLBACK_ROWS = 30;
+const CHAT_HISTORY_LIMIT = 8;
 
 const state = {
   manifest: null,
@@ -17,7 +17,13 @@ const state = {
   catalogExpanded: true,
   lastScan: null,
   modelSettings: null,
+  modelConfigRequired: false,
   quickToolTab: null,
+  selectedCourseText: "",
+  chatContextMode: "",
+  chatComposing: false,
+  knowledgeDrag: null,
+  knowledgeEditor: null,
   terminal: {
     sessionId: null,
     eventSource: null,
@@ -25,10 +31,11 @@ const state = {
     pageId: null,
     skillId: null,
     bootstrapPrompt: "",
-    activeAssistant: null,
-    turnActive: false,
-    lastSubmitted: "",
-    screen: null,
+    xterm: null,
+    fitAddon: null,
+    resizeObserver: null,
+    resizeTimer: null,
+    lastSize: { cols: TERMINAL_FALLBACK_COLS, rows: TERMINAL_FALLBACK_ROWS },
   },
 };
 
@@ -44,6 +51,7 @@ const elements = {
   pageTags: document.querySelector("#page-tags"),
   skillPanel: document.querySelector("#skill-panel"),
   pageContent: document.querySelector("#page-content"),
+  selectionAsk: document.querySelector("#selection-ask"),
   readerContext: document.querySelector("#reader-context"),
   copyAgentPrompt: document.querySelector("#copy-agent-prompt"),
   searchInput: document.querySelector("#global-search"),
@@ -52,6 +60,8 @@ const elements = {
   modelStatus: document.querySelector("#model-status"),
   modelConfigOpen: document.querySelector("#model-config-open"),
   modelConfigOverlay: document.querySelector("#model-config-overlay"),
+  modelConfigTitle: document.querySelector("#model-config-title"),
+  modelConfigDescription: document.querySelector("#model-config-description"),
   modelConfigClose: document.querySelector("#model-config-close"),
   modelConfigForm: document.querySelector("#model-config-form"),
   configProvider: document.querySelector("#config-provider"),
@@ -82,13 +92,9 @@ const elements = {
   terminalOverlay: document.querySelector("#terminal-overlay"),
   terminalTitle: document.querySelector("#terminal-title"),
   terminalStatus: document.querySelector("#terminal-status"),
-  terminalFeed: document.querySelector("#terminal-feed"),
-  terminalOutput: document.querySelector("#terminal-output"),
+  terminalEmulator: document.querySelector("#terminal-emulator"),
   terminalContext: document.querySelector("#terminal-context"),
-  terminalForm: document.querySelector("#terminal-form"),
-  terminalInput: document.querySelector("#terminal-input"),
   terminalVerify: document.querySelector("#terminal-verify"),
-  terminalSend: document.querySelector("#terminal-send"),
   terminalStop: document.querySelector("#terminal-stop"),
   terminalClose: document.querySelector("#terminal-close"),
 };
@@ -96,15 +102,16 @@ const elements = {
 await boot();
 
 async function boot() {
-  await Promise.all([refreshWikiState(), refreshRuntimeStatus(), refreshSkillPacks()]);
+  const [, modelPayload] = await Promise.all([refreshWikiState(), refreshRuntimeStatus(), refreshSkillPacks()]);
   wireEvents();
+  promptForModelConfigIfRequired(modelPayload);
 
   const firstPageId = state.manifest.modules[0]?.pages[0]?.id;
   if (firstPageId) {
     await loadPage(firstPageId);
+  } else {
+    addMessage("assistant", "还没有导入课件。导入课程目录后，可以按课件上下文继续问答。");
   }
-
-  addMessage("assistant", "课程知识库已加载。你可以搜索课程页，也可以直接问：我想做企业级检索增强项目，应该先学什么？");
 }
 
 function wireEvents() {
@@ -114,6 +121,7 @@ function wireEvents() {
     elements.searchResults.classList.add("hidden");
   });
   elements.chatExample.addEventListener("click", () => {
+    state.chatContextMode = "";
     elements.chatInput.value = "我想做企业级检索增强项目，应该先学什么？";
     elements.chatInput.focus();
   });
@@ -126,6 +134,27 @@ function wireEvents() {
   elements.configTest.addEventListener("click", handleModelConfigTest);
   elements.copyAgentPrompt.addEventListener("click", copyCurrentPagePrompt);
   elements.chatForm.addEventListener("submit", handleChatSubmit);
+  elements.chatInput.addEventListener("keydown", handleChatInputKeydown);
+  elements.chatInput.addEventListener("compositionstart", () => {
+    state.chatComposing = true;
+  });
+  elements.chatInput.addEventListener("compositionend", () => {
+    state.chatComposing = false;
+  });
+  elements.chatInput.addEventListener("input", handleChatInputChange);
+  elements.pageContent.addEventListener("mouseup", handleCourseSelectionChange);
+  elements.pageContent.addEventListener("keyup", handleCourseSelectionChange);
+  elements.selectionAsk.addEventListener("click", handleSelectionAskClick);
+  elements.moduleList.addEventListener("click", handleKnowledgeTreeAction);
+  elements.moduleList.addEventListener("submit", handleKnowledgeEditorSubmit);
+  elements.moduleList.addEventListener("keydown", handleKnowledgeEditorKeydown);
+  elements.moduleList.addEventListener("dragstart", handleKnowledgeDragStart);
+  elements.moduleList.addEventListener("dragover", handleKnowledgeDragOver);
+  elements.moduleList.addEventListener("dragleave", handleKnowledgeDragLeave);
+  elements.moduleList.addEventListener("drop", handleKnowledgeDrop);
+  elements.moduleList.addEventListener("dragend", handleKnowledgeDragEnd);
+  document.addEventListener("mousedown", handleDocumentMouseDown);
+  window.addEventListener("resize", hideSelectionAsk);
   elements.importToggle.addEventListener("click", toggleImportPanel);
   elements.collapseImport.addEventListener("click", hideImportPanel);
   elements.pickFolder.addEventListener("click", handlePickFolder);
@@ -136,11 +165,9 @@ function wireEvents() {
   elements.quickToolClose.addEventListener("click", closeQuickToolPanel);
   elements.quickToolBody.addEventListener("click", handleQuickToolBodyClick);
   elements.quickToolBody.addEventListener("input", handleQuickToolBodyInput);
-  elements.terminalForm.addEventListener("submit", handleTerminalSubmit);
   elements.terminalVerify.addEventListener("click", handleTerminalVerify);
   elements.terminalStop.addEventListener("click", stopTerminalSession);
   elements.terminalClose.addEventListener("click", closeTerminalPanel);
-  elements.terminalInput.addEventListener("keydown", handleTerminalKeydown);
 }
 
 async function refreshWikiState(options = {}) {
@@ -173,6 +200,8 @@ async function refreshRuntimeStatus() {
   if (importStatus.importedSources) {
     elements.importSummary.textContent = `已导入 ${importStatus.importedSources} 个来源，生成 ${importStatus.importedPages} 个知识页。`;
   }
+
+  return modelPayload;
 }
 
 function renderTopModelStatus(payload) {
@@ -239,6 +268,9 @@ function renderModules() {
 
     const row = document.createElement("div");
     row.className = "learn-tree-row learn-phase-row";
+    row.dataset.knowledgeType = "module";
+    row.dataset.moduleId = module.id;
+    row.draggable = true;
 
     const toggle = document.createElement("button");
     toggle.type = "button";
@@ -258,23 +290,52 @@ function renderModules() {
     `;
     title.addEventListener("click", () => toggleModule(module.id));
 
-    row.append(toggle, title);
+    const actions = document.createElement("div");
+    actions.className = "knowledge-actions";
+    actions.innerHTML = `
+      <button type="button" class="knowledge-action" data-knowledge-action="rename-module" data-module-id="${escapeAttribute(module.id)}" title="重命名目录" aria-label="重命名目录">${knowledgeIcon("edit")}</button>
+      <button type="button" class="knowledge-action danger" data-knowledge-action="delete-module" data-module-id="${escapeAttribute(module.id)}" title="删除目录" aria-label="删除目录">${knowledgeIcon("trash")}</button>
+    `;
+
+    row.append(toggle, title, actions);
     wrapper.append(row);
+    if (knowledgeEditorMatches("module", module.id)) {
+      wrapper.append(createKnowledgeEditorPanel({ type: "module", id: module.id, title: module.title, count: module.pages.length }));
+    }
 
     const children = document.createElement("div");
     children.className = "learn-tree-children";
 
     for (const page of module.pages) {
+      const row = document.createElement("div");
+      row.className = `learn-tree-row learn-lesson-row learn-lesson ${page.id === state.currentPageId ? "active" : ""}`;
+      row.dataset.knowledgeType = "page";
+      row.dataset.pageId = page.id;
+      row.dataset.moduleId = module.id;
+      row.draggable = true;
+
+      const spacer = document.createElement("span");
+      spacer.className = "learn-tree-toggle-spacer";
+      spacer.setAttribute("aria-hidden", "true");
+
       const button = document.createElement("button");
       button.type = "button";
-      button.className = `learn-tree-row learn-lesson-row learn-lesson ${page.id === state.currentPageId ? "active" : ""}`;
-      button.dataset.pageId = page.id;
-      button.innerHTML = `
-        <span class="learn-tree-toggle-spacer" aria-hidden="true"></span>
-        <span class="learn-tree-link"><span>${escapeHtml(page.title)}</span></span>
-      `;
+      button.className = "learn-tree-link learn-lesson-link";
+      button.innerHTML = `<span>${escapeHtml(page.title)}</span>`;
       button.addEventListener("click", () => loadPage(page.id));
-      children.append(button);
+
+      const actions = document.createElement("div");
+      actions.className = "knowledge-actions";
+      actions.innerHTML = `
+        <button type="button" class="knowledge-action" data-knowledge-action="rename-page" data-page-id="${escapeAttribute(page.id)}" title="重命名课件" aria-label="重命名课件">${knowledgeIcon("edit")}</button>
+        <button type="button" class="knowledge-action danger" data-knowledge-action="delete-page" data-page-id="${escapeAttribute(page.id)}" title="删除课件" aria-label="删除课件">${knowledgeIcon("trash")}</button>
+      `;
+
+      row.append(spacer, button, actions);
+      children.append(row);
+      if (knowledgeEditorMatches("page", page.id)) {
+        children.append(createKnowledgeEditorPanel({ type: "page", id: page.id, title: page.title, count: 0 }));
+      }
     }
 
     wrapper.append(children);
@@ -302,6 +363,7 @@ async function loadPage(pageId) {
   renderSkillPanel(page);
   elements.pageContent.innerHTML = page.html;
   elements.readerContext.textContent = page.title;
+  hideSelectionAsk();
 
   if (!state.expandedModules.has(page.module)) {
     state.expandedModules.add(page.module);
@@ -309,6 +371,7 @@ async function loadPage(pageId) {
   }
 
   updateActiveNav(page);
+  await loadChatHistory(page.id);
   if (state.quickToolTab) renderQuickToolPanel(state.quickToolTab);
 }
 
@@ -417,10 +480,6 @@ async function handleSkillPanelClick(event) {
 }
 
 async function openTerminalPanel(packId, skillId) {
-  if (state.terminal.sessionId) {
-    await stopTerminalSession();
-  }
-
   const pageId = state.currentPageId;
   const pageTitle = elements.pageTitle.textContent || "当前课件";
   elements.terminalOverlay.classList.remove("hidden");
@@ -432,21 +491,19 @@ async function openTerminalPanel(packId, skillId) {
     status: "starting",
   });
   resetTerminalBootstrap();
-  resetTerminalFeed();
-  state.terminal.screen = createTerminalScreen({ cols: TERMINAL_COLS, rows: TERMINAL_ROWS });
-  renderTerminalScreen();
-  elements.terminalInput.value = "";
-  elements.terminalInput.disabled = true;
-  elements.terminalSend.disabled = true;
   elements.terminalVerify.disabled = true;
-  addTerminalMessage("system", `正在为《${pageTitle}》启动赋范智能体。`);
-  appendTerminalLine(`正在为《${pageTitle}》启动独立智能体会话...`);
+  initializeTerminal();
+  detachTerminalEventStream();
+  resetTerminalEmulator();
+  setTerminalInputEnabled(false);
+  writeTerminalLocalLine(`正在为《${pageTitle}》启动赋范智能体...`);
+  const terminalSize = fitTerminalToPanel();
 
   try {
     const payload = await fetchJson("/api/terminal/sessions", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ packId, skillId, pageId, cols: TERMINAL_COLS, rows: TERMINAL_ROWS }),
+      body: JSON.stringify({ packId, skillId, pageId, cols: terminalSize.cols, rows: terminalSize.rows }),
     });
 
     state.terminal.sessionId = payload.session.id;
@@ -462,8 +519,6 @@ async function openTerminalPanel(packId, skillId) {
     ]
       .filter(Boolean)
       .join(" · ");
-    elements.terminalInput.disabled = false;
-    elements.terminalSend.disabled = false;
     elements.terminalVerify.disabled = !state.terminal.bootstrapPrompt;
     elements.terminalContext.innerHTML = renderTerminalContextCards({
       pageTitle: payload.session.page?.title || pageTitle,
@@ -472,21 +527,16 @@ async function openTerminalPanel(packId, skillId) {
       contextPath: payload.session.relativeContextFile,
       status: "ready",
     });
-    addTerminalMessage(
-      "system",
-      [
-        payload.session.page?.title ? `课件已绑定：${payload.session.page.title}` : "课件已绑定。",
-        payload.session.skill?.id ? `能力包已加载：${payload.session.skill.id}` : "能力包已加载。",
-        "现在可以直接提问；需要看标准效果时，点击“运行验证”。",
-      ].join("\n"),
-    );
     connectTerminalEvents(payload.session.id);
-    elements.terminalInput.focus();
+    setTerminalInputEnabled(true);
+    requestAnimationFrame(() => {
+      fitTerminalToPanel();
+      state.terminal.xterm?.focus();
+    });
   } catch (error) {
     elements.terminalStatus.textContent = "异常";
     elements.terminalContext.textContent = "控制台启动失败。";
-    addTerminalMessage("assistant", `启动失败：${error.message}`);
-    appendTerminalLine(`启动失败：${error.message}`);
+    writeTerminalLocalLine(`启动失败：${error.message}`);
   }
 }
 
@@ -499,23 +549,27 @@ function connectTerminalEvents(sessionId) {
   state.terminal.eventSource = source;
   source.addEventListener("terminal", (event) => {
     const payload = JSON.parse(event.data);
+    if (state.terminal.sessionId && sessionId !== state.terminal.sessionId) return;
     if (payload.type === "hello") {
       syncTerminalSession(payload.session);
     } else if (payload.type === "output") {
-      appendTerminalText(decodeTerminalOutput(payload.data));
+      writeTerminalOutput(decodeTerminalOutput(payload.data));
     } else if (payload.type === "status") {
       elements.terminalStatus.textContent = terminalDisplayStatus(payload.status);
       syncTerminalSession(payload.session);
     } else if (payload.type === "exit") {
       elements.terminalStatus.textContent = `已退出 ${payload.code ?? ""}`.trim();
-      appendTerminalLine(`进程已退出${payload.signal ? `：${payload.signal}` : ""}`);
-      elements.terminalInput.disabled = true;
-      elements.terminalSend.disabled = true;
+      state.terminal.sessionId = null;
+      state.terminal.packId = null;
+      state.terminal.pageId = null;
+      state.terminal.skillId = null;
       elements.terminalVerify.disabled = true;
+      setTerminalInputEnabled(false);
       source.close();
+      if (state.terminal.eventSource === source) state.terminal.eventSource = null;
     } else if (payload.type === "error") {
       elements.terminalStatus.textContent = "异常";
-      appendTerminalLine(payload.message || "终端进程异常。");
+      writeTerminalLocalLine(payload.message || "终端进程异常。");
     }
   });
   source.onerror = () => {
@@ -523,43 +577,17 @@ function connectTerminalEvents(sessionId) {
   };
 }
 
-async function handleTerminalSubmit(event) {
-  event.preventDefault();
-  const value = elements.terminalInput.value.trim();
-  if (!state.terminal.sessionId) return;
-  if (!value) return;
-
-  elements.terminalInput.value = "";
-  beginTerminalTurn(value, value);
-  await submitTerminalText(value);
-}
-
 async function handleTerminalVerify() {
   if (!state.terminal.sessionId || !state.terminal.bootstrapPrompt) return;
-  beginTerminalTurn("运行当前课件能力验证", state.terminal.bootstrapPrompt);
   await submitTerminalText(state.terminal.bootstrapPrompt);
 }
 
 async function submitTerminalText(value) {
   if (!state.terminal.sessionId) return;
-  const chunks = terminalInputChunks(value);
-  for (const [index, chunk] of chunks.entries()) {
-    if (index > 0) await sleep(terminalSubmitDelayMs(value));
-    await sendTerminalInput(chunk);
-  }
-}
-
-function handleTerminalKeydown(event) {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-    event.preventDefault();
-    elements.terminalForm.requestSubmit();
-    return;
-  }
-
-  if (event.key === "c" && event.ctrlKey && !elements.terminalInput.value) {
-    event.preventDefault();
-    sendTerminalInput("\x03");
-  }
+  await sendTerminalInput(String(value || ""));
+  await sleep(80);
+  await sendTerminalInput("\r");
+  state.terminal.xterm?.focus();
 }
 
 async function sendTerminalInput(data) {
@@ -571,23 +599,26 @@ async function sendTerminalInput(data) {
       body: JSON.stringify({ data }),
     });
   } catch (error) {
-    appendTerminalLine(`发送失败：${error.message}`);
+    writeTerminalLocalLine(`发送失败：${error.message}`);
   }
 }
 
 async function stopTerminalSession() {
-  if (!state.terminal.sessionId) return;
+  if (!state.terminal.sessionId) {
+    if (state.terminal.eventSource) {
+      state.terminal.eventSource.close();
+      state.terminal.eventSource = null;
+    }
+    setTerminalInputEnabled(false);
+    return;
+  }
   const sessionId = state.terminal.sessionId;
   state.terminal.sessionId = null;
   state.terminal.packId = null;
   state.terminal.pageId = null;
   state.terminal.skillId = null;
-  state.terminal.activeAssistant = null;
-  state.terminal.turnActive = false;
-  state.terminal.lastSubmitted = "";
   resetTerminalBootstrap();
-  elements.terminalInput.disabled = true;
-  elements.terminalSend.disabled = true;
+  setTerminalInputEnabled(false);
   elements.terminalVerify.disabled = true;
   if (state.terminal.eventSource) {
     state.terminal.eventSource.close();
@@ -603,28 +634,152 @@ async function stopTerminalSession() {
 }
 
 async function closeTerminalPanel() {
-  await stopTerminalSession();
+  detachTerminalSession();
   elements.terminalOverlay.classList.add("hidden");
   elements.terminalContext.textContent = "选择课件后打开控制台。";
-  resetTerminalFeed();
 }
 
-function appendTerminalLine(text) {
-  appendTerminalText(`${text}\n`);
-}
-
-function appendTerminalText(text) {
-  if (!state.terminal.screen) {
-    state.terminal.screen = createTerminalScreen({ cols: TERMINAL_COLS, rows: TERMINAL_ROWS });
+function detachTerminalSession() {
+  detachTerminalEventStream();
+  setTerminalInputEnabled(false);
+  if (state.terminal.sessionId) {
+    elements.terminalStatus.textContent = "已收起";
   }
-  state.terminal.screen.write(text);
-  renderTerminalScreen();
-  syncTerminalFeedFromScreen();
 }
 
-function renderTerminalScreen() {
-  elements.terminalOutput.textContent = state.terminal.screen ? state.terminal.screen.toString() : "";
-  elements.terminalOutput.scrollTop = elements.terminalOutput.scrollHeight;
+function detachTerminalEventStream() {
+  if (!state.terminal.eventSource) return;
+  state.terminal.eventSource.close();
+  state.terminal.eventSource = null;
+}
+
+function initializeTerminal() {
+  if (state.terminal.xterm) return;
+
+  const terminal = new Terminal({
+    allowTransparency: false,
+    cursorBlink: true,
+    cursorStyle: "block",
+    disableStdin: true,
+    fontFamily: '"JetBrains Mono", "Cascadia Code", "SFMono-Regular", ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
+    fontSize: 14,
+    lineHeight: 1.28,
+    macOptionIsMeta: true,
+    scrollback: 6000,
+    theme: {
+      background: "#0d1117",
+      foreground: "#dce6f5",
+      cursor: "#f8fafc",
+      selectionBackground: "#315efb66",
+      black: "#1f2937",
+      red: "#f87171",
+      green: "#7dd3a8",
+      yellow: "#facc15",
+      blue: "#7aa2ff",
+      magenta: "#c084fc",
+      cyan: "#67e8f9",
+      white: "#f8fafc",
+      brightBlack: "#64748b",
+      brightRed: "#fca5a5",
+      brightGreen: "#86efac",
+      brightYellow: "#fde68a",
+      brightBlue: "#93c5fd",
+      brightMagenta: "#d8b4fe",
+      brightCyan: "#a5f3fc",
+      brightWhite: "#ffffff",
+    },
+  });
+  const fitAddon = new FitAddon();
+  terminal.loadAddon(fitAddon);
+  terminal.open(elements.terminalEmulator);
+  terminal.onData((data) => {
+    sendTerminalInput(data);
+  });
+  terminal.onResize((size) => {
+    resizeTerminalSession(size);
+  });
+
+  state.terminal.xterm = terminal;
+  state.terminal.fitAddon = fitAddon;
+  if (typeof ResizeObserver !== "undefined") {
+    state.terminal.resizeObserver = new ResizeObserver(scheduleTerminalFit);
+    state.terminal.resizeObserver.observe(elements.terminalEmulator);
+  }
+  window.addEventListener("resize", scheduleTerminalFit);
+}
+
+function resetTerminalEmulator() {
+  initializeTerminal();
+  state.terminal.xterm?.reset();
+  state.terminal.xterm?.clear();
+}
+
+function writeTerminalOutput(text) {
+  initializeTerminal();
+  state.terminal.xterm?.write(text);
+}
+
+function writeTerminalLocalLine(text) {
+  initializeTerminal();
+  state.terminal.xterm?.writeln(String(text || ""));
+}
+
+function setTerminalInputEnabled(enabled) {
+  if (state.terminal.xterm) {
+    state.terminal.xterm.options.disableStdin = !enabled;
+  }
+}
+
+function scheduleTerminalFit() {
+  clearTimeout(state.terminal.resizeTimer);
+  state.terminal.resizeTimer = setTimeout(() => {
+    fitTerminalToPanel();
+  }, 60);
+}
+
+function fitTerminalToPanel() {
+  initializeTerminal();
+  try {
+    state.terminal.fitAddon?.fit();
+  } catch {
+    // The element may still be hidden during overlay transitions.
+  }
+  const size = normalizeTerminalSize({
+    cols: state.terminal.xterm?.cols || TERMINAL_FALLBACK_COLS,
+    rows: state.terminal.xterm?.rows || TERMINAL_FALLBACK_ROWS,
+  });
+  state.terminal.lastSize = size;
+  return size;
+}
+
+async function resizeTerminalSession(size) {
+  const next = normalizeTerminalSize(size);
+  const previous = state.terminal.lastSize;
+  state.terminal.lastSize = next;
+  if (!state.terminal.sessionId || (previous.cols === next.cols && previous.rows === next.rows)) return;
+
+  try {
+    await fetchJson(`/api/terminal/sessions/${encodeURIComponent(state.terminal.sessionId)}/resize`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(next),
+    });
+  } catch (error) {
+    elements.terminalStatus.textContent = `尺寸同步失败：${error.message}`;
+  }
+}
+
+function normalizeTerminalSize(size = {}) {
+  return {
+    cols: clampNumber(size.cols, 1, 500, TERMINAL_FALLBACK_COLS),
+    rows: clampNumber(size.rows, 1, 200, TERMINAL_FALLBACK_ROWS),
+  };
+}
+
+function clampNumber(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(number)));
 }
 
 function decodeTerminalOutput(base64) {
@@ -675,72 +830,14 @@ function renderTerminalContextCards({ pageTitle = "当前课件", skillId = "", 
       <div class="terminal-context-card mode">
         <span>模式</span>
         <strong>${escapeHtml(statusText)}</strong>
-        <em>点击验证才发送任务</em>
+        <em>原生 TUI 直连</em>
       </div>
     </div>
   `;
 }
 
-function resetTerminalFeed() {
-  elements.terminalFeed.innerHTML = "";
-  state.terminal.activeAssistant = null;
-  state.terminal.turnActive = false;
-  state.terminal.lastSubmitted = "";
-}
-
-function beginTerminalTurn(label, submitted) {
-  state.terminal.turnActive = true;
-  state.terminal.lastSubmitted = submitted;
-  addTerminalMessage("user", label);
-  state.terminal.activeAssistant = addTerminalMessage("assistant", "赋范智能体正在处理...");
-  setTerminalBusy(true);
-}
-
-function syncTerminalFeedFromScreen() {
-  if (!state.terminal.turnActive || !state.terminal.activeAssistant || !state.terminal.screen) return;
-  const screenText = state.terminal.screen.toString();
-  if (!terminalTurnCompleted(screenText)) return;
-
-  const transcript = cleanTerminalTranscript(screenText, { submitted: state.terminal.lastSubmitted });
-  updateTerminalMessage(
-    state.terminal.activeAssistant,
-    transcript || "执行完成。当前运行日志没有返回可提取的文本，可展开“原始运行日志”查看。",
-  );
-  state.terminal.activeAssistant = null;
-  state.terminal.turnActive = false;
-  state.terminal.lastSubmitted = "";
-  setTerminalBusy(false);
-}
-
-function addTerminalMessage(role, text) {
-  const message = document.createElement("div");
-  message.className = `terminal-message ${role}`;
-  const label = document.createElement("span");
-  label.className = "terminal-message-role";
-  label.textContent = role === "user" ? "你" : "赋范智能体";
-  const body = document.createElement("p");
-  body.textContent = text;
-  message.append(label, body);
-  elements.terminalFeed.append(message);
-  elements.terminalFeed.scrollTop = elements.terminalFeed.scrollHeight;
-  return message;
-}
-
-function updateTerminalMessage(message, text) {
-  const body = message.querySelector("p");
-  if (body) body.textContent = text;
-  elements.terminalFeed.scrollTop = elements.terminalFeed.scrollHeight;
-}
-
-function setTerminalBusy(busy) {
-  elements.terminalInput.disabled = busy || !state.terminal.sessionId;
-  elements.terminalSend.disabled = busy || !state.terminal.sessionId;
-  elements.terminalVerify.disabled = busy || !state.terminal.sessionId || !state.terminal.bootstrapPrompt;
-  elements.terminalStatus.textContent = busy ? "运行中" : state.terminal.sessionId ? "就绪" : elements.terminalStatus.textContent;
-}
-
 function terminalDisplayStatus(status) {
-  if (status === "running" && !state.terminal.turnActive) return "就绪";
+  if (status === "running") return "就绪";
   const labels = {
     running: "运行中",
     starting: "正在启动",
@@ -789,6 +886,423 @@ function updateActiveNav(page) {
   });
 }
 
+async function loadChatHistory(pageId) {
+  elements.chatLog.innerHTML = "";
+  state.messages = [];
+
+  try {
+    const payload = await fetchJson(`/api/chat/history?pageId=${encodeURIComponent(pageId)}&limit=50`);
+    const messages = payload.messages || [];
+    if (!messages.length) {
+      addMessage("assistant", `已打开《${currentPageTitle()}》。你可以直接围绕这节课继续提问。`);
+      return;
+    }
+
+    for (const message of messages) {
+      addMessage(message.role, message.content, message.sources || [], { html: message.answerHtml });
+      appendChatHistory(message.role, message.content);
+    }
+  } catch (error) {
+    addMessage("assistant", `聊天历史读取失败：${error.message}`);
+  }
+}
+
+async function handleKnowledgeTreeAction(event) {
+  const button = event.target.closest("button[data-knowledge-action]");
+  if (!button) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  try {
+    if (button.dataset.knowledgeAction === "rename-page") {
+      openKnowledgeEditor({ mode: "rename", type: "page", id: button.dataset.pageId });
+    } else if (button.dataset.knowledgeAction === "delete-page") {
+      openKnowledgeEditor({ mode: "delete", type: "page", id: button.dataset.pageId });
+    } else if (button.dataset.knowledgeAction === "rename-module") {
+      openKnowledgeEditor({ mode: "rename", type: "module", id: button.dataset.moduleId });
+    } else if (button.dataset.knowledgeAction === "delete-module") {
+      openKnowledgeEditor({ mode: "delete", type: "module", id: button.dataset.moduleId });
+    } else if (button.dataset.knowledgeAction === "cancel-editor") {
+      closeKnowledgeEditor();
+    }
+  } catch (error) {
+    addMessage("assistant", `知识库更新失败：${error.message}`);
+  }
+}
+
+function openKnowledgeEditor({ mode, type, id }) {
+  const target = type === "module" ? findManifestModuleState(id) : findManifestPage(id);
+  if (!target) return;
+
+  state.knowledgeEditor = {
+    mode,
+    type,
+    id,
+    title: target.title,
+    error: "",
+  };
+  renderModules();
+  requestAnimationFrame(() => focusKnowledgeEditor(mode === "rename"));
+}
+
+function closeKnowledgeEditor() {
+  state.knowledgeEditor = null;
+  renderModules();
+}
+
+function knowledgeEditorMatches(type, id) {
+  return state.knowledgeEditor?.type === type && state.knowledgeEditor?.id === id;
+}
+
+function createKnowledgeEditorPanel({ type, id, title, count }) {
+  const editor = state.knowledgeEditor || {};
+  const isRename = editor.mode === "rename";
+  const targetName = type === "module" ? "目录" : "课件";
+  const panel = document.createElement("form");
+  panel.className = `knowledge-editor ${isRename ? "is-rename" : "is-delete"}`;
+  panel.dataset.editorType = type;
+  panel.dataset.editorId = id;
+  panel.dataset.editorMode = editor.mode;
+  panel.noValidate = true;
+
+  if (isRename) {
+    panel.innerHTML = `
+      <div class="knowledge-editor-head">
+        <strong>重命名${targetName}</strong>
+        <span>只修改知识库显示名，引用跳转仍使用稳定 ID。</span>
+      </div>
+      <label class="knowledge-editor-field">
+        <span>新的${targetName}名称</span>
+        <input class="knowledge-editor-input" name="title" type="text" value="${escapeAttribute(title)}" autocomplete="off" />
+      </label>
+      ${editor.error ? `<div class="knowledge-editor-error">${escapeHtml(editor.error)}</div>` : ""}
+      <div class="knowledge-editor-actions">
+        <button type="button" class="knowledge-editor-button ghost" data-knowledge-action="cancel-editor" title="取消" aria-label="取消">${knowledgeIcon("x")}</button>
+        <button type="submit" class="knowledge-editor-button primary" title="保存" aria-label="保存">${knowledgeIcon("check")}</button>
+      </div>
+    `;
+    return panel;
+  }
+
+  const deleteHint =
+    type === "module"
+      ? `会隐藏该目录和其中 ${count} 个课件；历史问答仍保留在本地。`
+      : "会从目录、搜索和引用跳转中隐藏；历史问答仍保留在本地。";
+  panel.innerHTML = `
+    <div class="knowledge-editor-head">
+      <strong>删除${targetName}</strong>
+      <span title="${escapeAttribute(title)}">${escapeHtml(title)}</span>
+    </div>
+    <p>${escapeHtml(deleteHint)}</p>
+    ${editor.error ? `<div class="knowledge-editor-error">${escapeHtml(editor.error)}</div>` : ""}
+    <div class="knowledge-editor-actions">
+      <button type="button" class="knowledge-editor-button ghost" data-knowledge-action="cancel-editor" title="取消" aria-label="取消">${knowledgeIcon("x")}</button>
+      <button type="submit" class="knowledge-editor-button danger" title="确认删除" aria-label="确认删除">${knowledgeIcon("trash")}</button>
+    </div>
+  `;
+  return panel;
+}
+
+async function handleKnowledgeEditorSubmit(event) {
+  const form = event.target.closest(".knowledge-editor");
+  if (!form) return;
+
+  event.preventDefault();
+  const editor = state.knowledgeEditor;
+  if (!editor || editor.type !== form.dataset.editorType || editor.id !== form.dataset.editorId) return;
+
+  try {
+    if (editor.mode === "rename") {
+      const nextTitle = String(new FormData(form).get("title") || "").trim();
+      await submitKnowledgeRename(editor, nextTitle);
+    } else if (editor.mode === "delete") {
+      await submitKnowledgeDelete(editor);
+    }
+  } catch (error) {
+    setKnowledgeEditorError(error.message);
+  }
+}
+
+function handleKnowledgeEditorKeydown(event) {
+  if (!event.target.closest(".knowledge-editor")) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeKnowledgeEditor();
+  }
+}
+
+async function submitKnowledgeRename(editor, nextTitle) {
+  if (!nextTitle) {
+    throw new Error("名称不能为空");
+  }
+  if (nextTitle === editor.title) {
+    closeKnowledgeEditor();
+    return;
+  }
+
+  if (editor.type === "page") {
+    await fetchJson(`/api/knowledge/pages/${encodeURIComponent(editor.id)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: nextTitle }),
+    });
+    state.knowledgeEditor = null;
+    await refreshAfterKnowledgeChange({ preferredPageId: state.currentPageId, forceLoad: state.currentPageId === editor.id });
+    return;
+  }
+
+  await fetchJson(`/api/knowledge/modules/${encodeURIComponent(editor.id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ title: nextTitle }),
+  });
+  state.knowledgeEditor = null;
+  await refreshAfterKnowledgeChange({ preferredPageId: state.currentPageId });
+}
+
+async function submitKnowledgeDelete(editor) {
+  if (editor.type === "page") {
+    await fetchJson(`/api/knowledge/pages/${encodeURIComponent(editor.id)}`, { method: "DELETE" });
+    state.knowledgeEditor = null;
+    await refreshAfterKnowledgeChange({ preferredPageId: state.currentPageId === editor.id ? null : state.currentPageId });
+    return;
+  }
+
+  const module = findManifestModuleState(editor.id);
+  const currentInModule = module?.pages.some((page) => page.id === state.currentPageId);
+  await fetchJson(`/api/knowledge/modules/${encodeURIComponent(editor.id)}`, { method: "DELETE" });
+  state.knowledgeEditor = null;
+  await refreshAfterKnowledgeChange({ preferredPageId: currentInModule ? null : state.currentPageId });
+}
+
+function setKnowledgeEditorError(message) {
+  if (!state.knowledgeEditor) return;
+  state.knowledgeEditor = { ...state.knowledgeEditor, error: message };
+  renderModules();
+  requestAnimationFrame(() => focusKnowledgeEditor(false));
+}
+
+function focusKnowledgeEditor(selectText) {
+  const input = elements.moduleList.querySelector(".knowledge-editor-input");
+  if (!input) return;
+  input.focus();
+  if (selectText) input.select();
+}
+
+function knowledgeIcon(name) {
+  const paths = {
+    edit: '<path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />',
+    trash: '<path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v5" /><path d="M14 11v5" />',
+    x: '<path d="M18 6 6 18" /><path d="m6 6 12 12" />',
+    check: '<path d="m20 6-11 11-5-5" />',
+  };
+
+  return `<svg class="knowledge-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">${paths[name] || ""}</svg>`;
+}
+
+function handleKnowledgeDragStart(event) {
+  if (event.target.closest(".knowledge-actions") || event.target.closest(".knowledge-editor")) {
+    event.preventDefault();
+    return;
+  }
+
+  const target = knowledgeDropTarget(event.target);
+  if (!target) return;
+
+  const type = target.dataset.knowledgeType;
+  const id = type === "page" ? target.dataset.pageId : target.dataset.moduleId;
+  if (!type || !id) return;
+
+  state.knowledgeDrag = { type, id };
+  target.classList.add("is-dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", JSON.stringify(state.knowledgeDrag));
+}
+
+function handleKnowledgeDragOver(event) {
+  const target = knowledgeDropTarget(event.target);
+  if (!canDropKnowledgeTarget(target)) return;
+
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  clearKnowledgeDragOver();
+  target.classList.add("drag-over");
+}
+
+function handleKnowledgeDragLeave(event) {
+  const target = knowledgeDropTarget(event.target);
+  if (target && !target.contains(event.relatedTarget)) {
+    target.classList.remove("drag-over");
+  }
+}
+
+async function handleKnowledgeDrop(event) {
+  const target = knowledgeDropTarget(event.target);
+  if (!canDropKnowledgeTarget(target)) return;
+
+  event.preventDefault();
+  const drag = state.knowledgeDrag;
+  clearKnowledgeDragClasses();
+
+  try {
+    if (drag.type === "module") {
+      await reorderKnowledgeModules(drag.id, target.dataset.moduleId);
+    } else if (drag.type === "page") {
+      await reorderKnowledgePage(drag.id, target);
+    }
+  } catch (error) {
+    addMessage("assistant", `知识库排序失败：${error.message}`);
+  } finally {
+    state.knowledgeDrag = null;
+  }
+}
+
+function handleKnowledgeDragEnd() {
+  state.knowledgeDrag = null;
+  clearKnowledgeDragClasses();
+}
+
+async function reorderKnowledgeModules(sourceModuleId, targetModuleId) {
+  if (!sourceModuleId || !targetModuleId || sourceModuleId === targetModuleId) return;
+
+  const moduleIds = moveBefore(
+    state.manifest.modules.map((module) => module.id),
+    sourceModuleId,
+    targetModuleId,
+  );
+  await fetchJson("/api/knowledge/reorder", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      modules: moduleIds.map((id, sortOrder) => ({ id, sortOrder })),
+    }),
+  });
+  await refreshAfterKnowledgeChange({ preferredPageId: state.currentPageId });
+}
+
+async function reorderKnowledgePage(sourcePageId, target) {
+  const targetType = target.dataset.knowledgeType;
+  const targetModuleId = target.dataset.moduleId;
+  const targetPageId = targetType === "page" ? target.dataset.pageId : "";
+  if (!sourcePageId || !targetModuleId || sourcePageId === targetPageId) return;
+
+  const modulePageIds = new Map(state.manifest.modules.map((module) => [module.id, module.pages.map((page) => page.id)]));
+  for (const pages of modulePageIds.values()) {
+    const index = pages.indexOf(sourcePageId);
+    if (index >= 0) pages.splice(index, 1);
+  }
+
+  const targetPages = modulePageIds.get(targetModuleId);
+  if (!targetPages) return;
+
+  const insertIndex = targetPageId ? targetPages.indexOf(targetPageId) : targetPages.length;
+  targetPages.splice(insertIndex >= 0 ? insertIndex : targetPages.length, 0, sourcePageId);
+
+  const pages = [];
+  for (const [moduleId, pageIds] of modulePageIds) {
+    pageIds.forEach((id, sortOrder) => {
+      pages.push({ id, moduleId, sortOrder });
+    });
+  }
+
+  await fetchJson("/api/knowledge/reorder", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pages }),
+  });
+  await refreshAfterKnowledgeChange({ preferredPageId: state.currentPageId, forceLoad: state.currentPageId === sourcePageId });
+}
+
+async function refreshAfterKnowledgeChange({ preferredPageId = state.currentPageId, forceLoad = false } = {}) {
+  await refreshWikiState();
+
+  if (preferredPageId && findManifestPage(preferredPageId)) {
+    if (forceLoad) {
+      await loadPage(preferredPageId);
+    } else if (state.currentPage) {
+      updateActiveNav(state.currentPage);
+    }
+    return;
+  }
+
+  const nextPageId = firstManifestPageId();
+  if (nextPageId) {
+    await loadPage(nextPageId);
+  } else {
+    clearCurrentCourseView();
+  }
+}
+
+function clearCurrentCourseView() {
+  state.currentPage = null;
+  state.currentPageId = null;
+  state.currentModuleId = null;
+  state.messages = [];
+  elements.pageType.textContent = "-";
+  elements.pageDifficulty.textContent = "-";
+  elements.pageDuration.textContent = "-";
+  elements.pageTitle.textContent = "暂无课件";
+  elements.pageSummary.textContent = "导入课件后会在这里显示正文。";
+  elements.pageTags.innerHTML = "";
+  elements.pageContent.innerHTML = "";
+  elements.chatLog.innerHTML = "";
+  addMessage("assistant", "当前知识库没有可用课件。");
+}
+
+function knowledgeDropTarget(target) {
+  return target?.closest?.("[data-knowledge-type]") || null;
+}
+
+function canDropKnowledgeTarget(target) {
+  const drag = state.knowledgeDrag;
+  if (!drag || !target) return false;
+
+  const targetType = target.dataset.knowledgeType;
+  if (drag.type === "module") {
+    return targetType === "module" && target.dataset.moduleId !== drag.id;
+  }
+
+  if (drag.type === "page") {
+    if (targetType === "module") return Boolean(target.dataset.moduleId);
+    return targetType === "page" && target.dataset.pageId !== drag.id;
+  }
+
+  return false;
+}
+
+function clearKnowledgeDragOver() {
+  document.querySelectorAll(".drag-over").forEach((item) => item.classList.remove("drag-over"));
+}
+
+function clearKnowledgeDragClasses() {
+  clearKnowledgeDragOver();
+  document.querySelectorAll(".is-dragging").forEach((item) => item.classList.remove("is-dragging"));
+}
+
+function moveBefore(items, sourceId, targetId) {
+  const next = items.filter((id) => id !== sourceId);
+  const targetIndex = next.indexOf(targetId);
+  next.splice(targetIndex >= 0 ? targetIndex : next.length, 0, sourceId);
+  return next;
+}
+
+function firstManifestPageId() {
+  return state.manifest?.modules?.find((module) => module.pages.length)?.pages[0]?.id || null;
+}
+
+function findManifestModuleState(moduleId) {
+  return state.manifest?.modules?.find((module) => module.id === moduleId) || null;
+}
+
+function findManifestPage(pageId) {
+  for (const module of state.manifest?.modules || []) {
+    const page = module.pages.find((item) => item.id === pageId);
+    if (page) return { ...page, moduleId: module.id };
+  }
+  return null;
+}
+
 async function handleSearch() {
   const query = elements.searchInput.value.trim();
   if (!query) {
@@ -827,30 +1341,189 @@ async function handleChatSubmit(event) {
   await submitChatMessage(message);
 }
 
+function handleChatInputKeydown(event) {
+  if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.isComposing || state.chatComposing) return;
+
+  event.preventDefault();
+  elements.chatForm.requestSubmit();
+}
+
 async function submitChatMessage(message) {
   const text = String(message || "").trim();
   if (!text) return;
 
+  const contextMode = state.chatContextMode;
+  const conversationHistory = buildConversationHistoryPayload();
   elements.chatInput.value = "";
+  appendChatHistory("user", text);
   addMessage("user", text);
-  const pending = addMessage("assistant", "正在检索课程知识库...");
+  const pendingText =
+    contextMode === "current-page"
+      ? `正在结合《${currentPageTitle()}》分析当前课件...`
+      : `正在结合《${currentPageTitle()}》检索课程知识库...`;
+  const pending = addMessage("assistant", pendingText);
 
   try {
     const payload = await fetchJson("/api/chat", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({
+        message: text,
+        pageId: state.currentPageId,
+        moduleId: state.currentModuleId,
+        contextMode,
+        conversationHistory,
+      }),
     });
     pending.remove();
-    addMessage("assistant", payload.answer, payload.sources);
+    addMessage("assistant", payload.answer, payload.sources, { html: payload.answerHtml });
+    appendChatHistory("assistant", payload.answer);
     if (payload.llmError) {
-      markModelError(payload.llmError);
-      addMessage("assistant", `模型没有接通：${payload.llmError}\n\n不过课程知识库检索已经生效，上面的回答来自当前命中的课程知识页。`);
+      if (shouldMarkModelError(payload.llmError)) {
+        markModelError(payload.llmError);
+      }
+      if (contextMode !== "current-page") {
+        addMessage("assistant", `${modelFallbackNotice(payload.llmError)}\n\n不过课程知识库检索已经生效，上面的回答来自当前命中的课程知识页。`);
+      }
     }
   } catch (error) {
     pending.remove();
     addMessage("assistant", `请求失败：${error.message}`);
+  } finally {
+    state.chatContextMode = "";
   }
+}
+
+function handleChatInputChange() {
+  if (!elements.chatInput.value.trim()) {
+    state.chatContextMode = "";
+  }
+}
+
+function shouldMarkModelError(message) {
+  return !/empty answer/i.test(String(message || ""));
+}
+
+function modelFallbackNotice(message) {
+  if (/empty answer/i.test(String(message || ""))) {
+    return "模型这次没有返回可用内容，已使用课程知识库生成兜底回答。";
+  }
+  return `模型没有接通：${message}`;
+}
+
+function appendChatHistory(role, content) {
+  const text = capUiText(String(content || "").replace(/\s+/g, " ").trim(), 900);
+  if (!text || (role !== "user" && role !== "assistant")) return;
+
+  state.messages.push({ role, content: text });
+  if (state.messages.length > CHAT_HISTORY_LIMIT) {
+    state.messages.splice(0, state.messages.length - CHAT_HISTORY_LIMIT);
+  }
+}
+
+function buildConversationHistoryPayload() {
+  return state.messages.slice(-CHAT_HISTORY_LIMIT).map((item) => ({
+    role: item.role,
+    content: item.content,
+  }));
+}
+
+function handleCourseSelectionChange() {
+  setTimeout(showSelectionAskForCurrentSelection, 0);
+}
+
+function showSelectionAskForCurrentSelection() {
+  const selection = window.getSelection();
+  const selectedText = normalizeSelectionText(selection?.toString() || "");
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed || selectedText.length < 2) {
+    hideSelectionAsk();
+    return;
+  }
+
+  const range = selection.getRangeAt(0);
+  if (!selectionBelongsToPage(range)) {
+    hideSelectionAsk();
+    return;
+  }
+
+  const rect = selectionRangeRect(range);
+  if (!rect) {
+    hideSelectionAsk();
+    return;
+  }
+
+  state.selectedCourseText = capUiText(selectedText, 800);
+  positionSelectionAsk(rect);
+}
+
+function handleSelectionAskClick() {
+  const selectedText = state.selectedCourseText || normalizeSelectionText(window.getSelection()?.toString() || "");
+  if (!selectedText) return;
+
+  hideSelectionAsk();
+  const prompt = [
+    `请结合当前课件《${currentPageTitle()}》，解释下面这段内容，并说明它在本节课里的作用：`,
+    "",
+    capUiText(selectedText, 800),
+    "",
+    "我的问题：",
+  ].join("\n");
+  state.chatContextMode = "current-page";
+  elements.chatInput.value = prompt;
+  elements.chatInput.focus();
+  elements.chatInput.setSelectionRange(elements.chatInput.value.length, elements.chatInput.value.length);
+}
+
+function handleDocumentMouseDown(event) {
+  if (elements.selectionAsk.contains(event.target)) return;
+  if (elements.pageContent.contains(event.target)) return;
+  hideSelectionAsk();
+}
+
+function hideSelectionAsk() {
+  state.selectedCourseText = "";
+  elements.selectionAsk.classList.add("hidden");
+}
+
+function selectionBelongsToPage(range) {
+  const container = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  return Boolean(container && elements.pageContent.contains(container));
+}
+
+function selectionRangeRect(range) {
+  const rect = range.getBoundingClientRect();
+  if (rect.width || rect.height) return rect;
+  return Array.from(range.getClientRects()).find((item) => item.width || item.height) || null;
+}
+
+function positionSelectionAsk(rect) {
+  elements.selectionAsk.classList.remove("hidden");
+  const buttonRect = elements.selectionAsk.getBoundingClientRect();
+  const width = buttonRect.width || 64;
+  const height = buttonRect.height || 34;
+  const left = clamp(rect.left + rect.width / 2 - width / 2, 12, window.innerWidth - width - 12);
+  const aboveTop = rect.top - height - 8;
+  const top = aboveTop >= 8 ? aboveTop : rect.bottom + 8;
+
+  elements.selectionAsk.style.left = `${Math.round(left)}px`;
+  elements.selectionAsk.style.top = `${Math.round(top)}px`;
+}
+
+function normalizeSelectionText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function capUiText(value, limit) {
+  const text = String(value || "").trim();
+  return text.length > limit ? `${text.slice(0, limit).trim()}...` : text;
+}
+
+function clamp(value, min, max) {
+  if (max < min) return min;
+  return Math.min(Math.max(value, min), max);
 }
 
 async function handleQuickToolClick(event) {
@@ -863,6 +1536,7 @@ async function handleQuickToolClick(event) {
   if (tool === "ai") {
     closeQuickToolPanel();
     focusChatAssistant();
+    state.chatContextMode = "";
     elements.chatInput.value = `请基于当前课件《${currentPageTitle()}》，帮我解释这节课的重点和下一步练习。`;
     elements.chatInput.select();
     return;
@@ -1078,12 +1752,28 @@ function setTopModelStatus(level, message) {
   elements.modelStatus.innerHTML = `<span class="status-dot"></span>${escapeHtml(message)}`;
 }
 
-function openModelConfig() {
+function promptForModelConfigIfRequired(modelPayload) {
+  if (modelPayload?.settings?.configured) return;
+  openModelConfig({ required: true });
+}
+
+function openModelConfig(options = {}) {
   const settings = state.modelSettings || {};
+  const required = Boolean(options.required);
+  state.modelConfigRequired = required;
+  elements.modelConfigOverlay.classList.toggle("is-required", required);
+  elements.modelConfigTitle.textContent = required ? "配置 DeepSeek API" : "模型配置";
+  elements.modelConfigDescription.textContent = required
+    ? "首次使用需要验证并保存你的 DeepSeek API Key，后续课程问答和智能体控制台都会读取这份配置。"
+    : "保存后立即用于课程问答和新打开的智能体控制台。";
+  elements.modelConfigClose.hidden = required;
   elements.configProvider.value = settings.provider || "deepseek";
   elements.configBaseUrl.value = settings.baseUrl || "https://api.deepseek.com";
   elements.configModel.value = settings.model || "deepseek-v4-flash";
   elements.configApiKey.value = "";
+  elements.configApiKey.required = required && !settings.configured;
+  elements.configApiKey.placeholder = required ? "请输入你的 DeepSeek API Key" : "留空则保留当前密钥";
+  elements.configSave.textContent = required ? "验证并保存" : "保存配置";
   elements.modelConfigOverlay.classList.remove("hidden");
   renderConfigStatus({
     llm: { ok: Boolean(settings.configured), message: settings.configured ? `已保存密钥：${settings.apiKeyMasked}` : "尚未保存模型密钥" },
@@ -1093,11 +1783,26 @@ function openModelConfig() {
 }
 
 function closeModelConfig() {
+  if (state.modelConfigRequired && !state.modelSettings?.configured) {
+    renderConfigStatus({ llm: { ok: false, message: "请先验证并保存 DeepSeek API Key。" } });
+    elements.configApiKey.focus();
+    return;
+  }
+  state.modelConfigRequired = false;
+  elements.modelConfigOverlay.classList.remove("is-required");
+  elements.modelConfigClose.hidden = false;
+  elements.configApiKey.required = false;
+  elements.configSave.textContent = "保存配置";
   elements.modelConfigOverlay.classList.add("hidden");
 }
 
 async function handleModelConfigSave(event) {
   event.preventDefault();
+  if (state.modelConfigRequired) {
+    await verifyAndSaveRequiredModelConfig();
+    return;
+  }
+
   setConfigBusy(true, "正在保存配置...");
   try {
     const payload = await fetchJson("/api/settings/model", {
@@ -1125,6 +1830,42 @@ async function handleModelConfigSave(event) {
     addMessage("assistant", "模型配置已保存。后续课程问答和新打开的智能体控制台都会使用这份配置。");
   } catch (error) {
     renderConfigStatus({ llm: { ok: false, message: `保存失败：${error.message}` } });
+  } finally {
+    setConfigBusy(false);
+    await refreshRuntimeStatus();
+  }
+}
+
+async function verifyAndSaveRequiredModelConfig() {
+  const form = readModelConfigForm();
+  if (!form.apiKey) {
+    renderConfigStatus({ llm: { ok: false, message: "请输入 DeepSeek API Key 后再验证。" } });
+    elements.configApiKey.focus();
+    return;
+  }
+
+  setConfigBusy(true, "正在验证并保存模型配置...");
+  try {
+    const payload = await fetchJson("/api/settings/model/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...form, saveOnSuccess: true }),
+    });
+    renderConfigStatus(payload);
+    if (!payload.llm?.ok) {
+      setTopModelStatus("error", payload.llm?.message || "模型连接失败");
+      return;
+    }
+
+    state.modelSettings = payload.settings;
+    elements.configApiKey.value = "";
+    renderTopModelStatus(payload);
+    state.modelConfigRequired = false;
+    closeModelConfig();
+    addMessage("assistant", "DeepSeek API 已验证并保存。现在可以继续使用课程问答和赋范智能体控制台。");
+  } catch (error) {
+    setTopModelStatus("error", `模型测试失败：${error.message}`);
+    renderConfigStatus({ llm: { ok: false, message: `验证失败：${error.message}` } });
   } finally {
     setConfigBusy(false);
     await refreshRuntimeStatus();
@@ -1305,12 +2046,18 @@ async function handleImportCourse() {
   }
 }
 
-function addMessage(role, text, sources = []) {
+function addMessage(role, text, sources = [], options = {}) {
   const wrapper = document.createElement("div");
   wrapper.className = `message ${role}`;
-  const paragraph = document.createElement("p");
-  paragraph.textContent = text;
-  wrapper.append(paragraph);
+  const body = document.createElement("div");
+  if (role === "assistant" && options.html) {
+    body.className = "message-markdown";
+    body.innerHTML = options.html;
+  } else {
+    body.className = "message-text";
+    body.textContent = text;
+  }
+  wrapper.append(body);
 
   if (sources.length) {
     const list = document.createElement("div");

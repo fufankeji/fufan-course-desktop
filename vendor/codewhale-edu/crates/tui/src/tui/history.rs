@@ -33,12 +33,13 @@ const TOOL_RUNNING_SYMBOLS: [&str; 4] = ["·", "◦", "•", "◦"];
 // ~2.88 s — fast enough that the user sees motion within a few hundred ms of
 // starting a tool, slow enough to read as a pulse rather than a strobe.
 const TOOL_STATUS_SYMBOL_MS: u64 = 720;
-/// Visual marker for the user role at the start of their message line. Solid
-/// vertical bar — no animation; user input is a finished thing.
-const USER_GLYPH: &str = "\u{258E}"; // ▎
-/// Visual marker for the assistant role. Solid bullet that pulses at 2s
-/// cycle while the response is streaming, holds full brightness when idle.
-const ASSISTANT_GLYPH: &str = "\u{25CF}"; // ●
+/// Visible label for the user role at the start of their message line.
+/// User turns are highlighted as input blocks, so a short literal label is
+/// easier to scan than a standalone glyph.
+const USER_GLYPH: &str = "你";
+/// Visible label for assistant turns. The embedded desktop surface needs to
+/// distinguish model output from prior user input without relying on color.
+const ASSISTANT_GLYPH: &str = "赋范智能体";
 /// Transcript body left rail. Solid 1/8 block (`▏`) followed by a space —
 /// used as a visual left-margin anchor for continuation lines, tool-card
 /// detail rows, and affordance lines. Dimmed so it guides the eye without
@@ -3468,7 +3469,7 @@ fn user_body_style() -> Style {
     Style::default().fg(palette::USER_BODY)
 }
 
-/// Style for the assistant glyph (`●`). When the cell is streaming and
+/// Style for the assistant role label. When the cell is streaming and
 /// motion is allowed, the foreground pulses on a 2s cycle between 30% and
 /// 100% brightness — the only deliberately animated element in a calm
 /// transcript. When idle (or low_motion is on) it sits at the full DeepSeek
@@ -4567,6 +4568,34 @@ mod tests {
     }
 
     #[test]
+    fn user_and_assistant_turns_render_distinct_role_headers() {
+        let user = HistoryCell::User {
+            content: "帮我解释这一节".to_string(),
+        };
+        let assistant = HistoryCell::Assistant {
+            content: "这节主要讲 Python 环境配置。".to_string(),
+            streaming: false,
+        };
+
+        let user_text = lines_text(&user.lines_with_options(80, TranscriptRenderOptions::default()));
+        let assistant_text =
+            lines_text(&assistant.lines_with_options(80, TranscriptRenderOptions::default()));
+
+        assert!(
+            user_text.contains("你"),
+            "user turns need a visible role label: {user_text}"
+        );
+        assert!(
+            assistant_text.contains("赋范智能体"),
+            "assistant turns need a visible role label: {assistant_text}"
+        );
+        assert!(
+            !user_text.contains("赋范智能体"),
+            "user turns must stay visually distinct from assistant turns: {user_text}"
+        );
+    }
+
+    #[test]
     fn render_thinking_streaming_truncated_shows_continues_affordance() {
         // #861 RC4: when a streaming thinking block exceeds the line cap,
         // surface a live affordance pointing at Ctrl+O. The earlier code
@@ -4635,15 +4664,14 @@ mod tests {
         assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
     }
 
-    // === Speaker glyph tests (v0.6.6 UI redesign) ===
+    // === Speaker label tests ===
     //
-    // The literal "Assistant" / "You" labels are replaced by the calmer
-    // bullet/bar glyphs (`●` / `▎`). Only the assistant glyph pulses, and
-    // only while the cell is streaming — finished turns sit at the source
-    // sky color so the transcript reads as solid history.
+    // Embedded course sessions use short Chinese role labels so users can
+    // distinguish their prompts from assistant prose even in monochrome
+    // screenshots.
 
     #[test]
-    fn user_cell_renders_with_bar_glyph_not_literal_label() {
+    fn user_cell_renders_with_visible_user_label() {
         let cell = HistoryCell::User {
             content: "hello".to_string(),
         };
@@ -4728,7 +4756,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_cell_renders_with_bullet_glyph_not_literal_label() {
+    fn assistant_cell_renders_with_visible_assistant_label() {
         let cell = HistoryCell::Assistant {
             content: "ready".to_string(),
             streaming: false,
@@ -4741,10 +4769,6 @@ mod tests {
             .iter()
             .map(|s| s.content.as_ref())
             .collect::<String>();
-        assert!(
-            !visible.contains("Assistant"),
-            "assistant label dropped: {visible:?}"
-        );
         assert!(visible.contains("ready"));
         assert_ne!(head.style.bg, Some(palette::SURFACE_ELEVATED));
     }
@@ -4769,7 +4793,7 @@ mod tests {
             }
         }
 
-        // Sanity: real prose still renders the role glyph as its first span.
+        // Sanity: real prose still renders the role label as its first span.
         let cell = HistoryCell::Assistant {
             content: "hi".to_string(),
             streaming: false,

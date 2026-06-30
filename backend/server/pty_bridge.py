@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import errno
 import fcntl
+import json
 import os
 import pty
 import select
@@ -31,6 +32,7 @@ def main():
     command = sys.argv[1]
     cols = int(sys.argv[2]) if len(sys.argv) >= 3 else 100
     rows = int(sys.argv[3]) if len(sys.argv) >= 4 else 30
+    resize_control_path = sys.argv[4] if len(sys.argv) >= 5 else ""
 
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -47,8 +49,26 @@ def main():
         except OSError:
             pass
 
+    def resize_child(_signum, _frame):
+        if not resize_control_path:
+            return
+        try:
+            with open(resize_control_path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+            next_cols = int(payload.get("cols", cols))
+            next_rows = int(payload.get("rows", rows))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+        set_window_size(master_fd, next_rows, next_cols)
+        try:
+            os.kill(pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
     signal.signal(signal.SIGTERM, stop_child)
     signal.signal(signal.SIGINT, stop_child)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, resize_child)
 
     while True:
         try:

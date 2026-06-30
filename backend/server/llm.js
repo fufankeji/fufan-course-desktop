@@ -76,13 +76,23 @@ export async function testDeepSeekConnection({ env = process.env, fetchImpl = fe
   }
 }
 
-export async function answerWithDeepSeek({ message, sourcePages, env = process.env, fetchImpl = fetch }) {
+export async function answerWithDeepSeek({
+  message,
+  sourcePages,
+  currentPageId,
+  contextMode,
+  conversationHistory = [],
+  env = process.env,
+  fetchImpl = fetch,
+}) {
   const apiKey = env.DEEPSEEK_API_KEY;
   if (!apiKey) return null;
 
   const baseUrl = (env.DEEPSEEK_BASE_URL || DEFAULT_DEEPSEEK_BASE_URL).replace(/\/+$/, "");
   const model = env.DEEPSEEK_MODEL || DEFAULT_DEEPSEEK_MODEL;
-  const context = buildCourseContext(sourcePages);
+  const context = buildCourseContext(sourcePages, { currentPageId });
+  const conversationContext = buildConversationContext(conversationHistory);
+  const currentPageOnly = contextMode === "current-page";
   const response = await postChatCompletion({
     url: `${baseUrl}/chat/completions`,
     apiKey,
@@ -96,14 +106,28 @@ export async function answerWithDeepSeek({ message, sourcePages, env = process.e
           content: [
             "你是课程知识库学习助教。",
             "必须优先基于提供的课程资料索引回答，不要编造不存在的课程内容。",
+            "当资料索引里包含“当前课件”时，优先结合当前课件解释用户问题。",
+            currentPageOnly
+              ? "本次请求来自用户选中的课件片段，不需要输出知识库引用列表，也不要复述或粘贴课件原文；直接回答用户最后提出的问题。"
+              : "",
             "回答要面向正在学习 AI Agent 工程课的学员，给出清晰路径、关键步骤和可执行建议。",
             "如果课程资料索引不足以回答，明确说明不足，并建议学员补充哪类资料。",
             "引用资料时使用《知识页标题》的形式。",
-          ].join("\n"),
+          ]
+            .filter(Boolean)
+            .join("\n"),
         },
         {
           role: "user",
-          content: [`用户问题：${message}`, "", "课程资料索引：", context].join("\n"),
+          content: [
+            conversationContext ? `最近对话：\n${conversationContext}` : "",
+            `用户问题：${message}`,
+            "",
+            "课程资料索引：",
+            context,
+          ]
+            .filter(Boolean)
+            .join("\n"),
         },
       ],
       temperature: 0.2,
@@ -245,20 +269,36 @@ function escapeCurlConfig(value) {
     .replace(/\n/g, "\\n");
 }
 
-function buildCourseContext(sourcePages) {
+function buildCourseContext(sourcePages, { currentPageId } = {}) {
   return sourcePages
     .slice(0, 5)
     .map((page, index) => {
+      const label = page.id === currentPageId ? "当前课件" : `资料 ${index + 1}`;
       const lines = [
-        `【资料 ${index + 1}】《${page.title}》`,
+        `【${label}】《${page.title}》`,
         `来源：${page.metadata?.relativePath || page.path || page.id}`,
       ];
       const tags = Array.isArray(page.tags) ? page.tags.filter(Boolean).slice(0, 6) : [];
       if (tags.length) lines.push(`标签：${tags.join("、")}`);
       lines.push(`摘要：${capText(page.summary || "无", 360)}`);
+      if (page.id === currentPageId) {
+        const excerpt = capText(page.body || page.plainText || "", 900);
+        if (excerpt) lines.push(`正文摘录：${excerpt}`);
+      }
       return lines.join("\n");
     })
     .join("\n\n---\n\n");
+}
+
+function buildConversationContext(history) {
+  if (!Array.isArray(history) || !history.length) return "";
+  return history
+    .slice(-8)
+    .map((item) => {
+      const role = item.role === "assistant" ? "助教" : "用户";
+      return `${role}：${capText(item.content, 500)}`;
+    })
+    .join("\n");
 }
 
 function capText(value, limit) {

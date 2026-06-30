@@ -1,3 +1,7 @@
+export function shouldSubmitTerminalKey(event = {}) {
+  return event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229;
+}
+
 export function terminalInputChunks(value) {
   const text = String(value || "");
   if (!text.trim()) return ["\r"];

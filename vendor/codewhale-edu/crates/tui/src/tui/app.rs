@@ -1507,9 +1507,9 @@ pub struct App {
     /// the draw loop the decision is already made. See the
     /// `Settings::synchronized_output` doc for the user-facing knob.
     pub synchronized_output_enabled: bool,
-    /// Header status-indicator chip mode. One of `"whale"` (default, cycles
-    /// 🐳→🐋 frames keyed off `turn_started_at`), `"dots"` (geometric ◌
-    /// frames), or `"off"` (chip hidden entirely). Loaded from settings;
+    /// Header status-indicator chip mode. One of `"dots"` (default,
+    /// geometric ◌ frames), `"whale"` (legacy 🐳→🐋 frames keyed off
+    /// `turn_started_at`), or `"off"` (chip hidden entirely). Loaded from settings;
     /// changed via `/config status_indicator <whale|dots|off>`.
     pub status_indicator: String,
     pub show_thinking: bool,

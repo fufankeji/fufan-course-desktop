@@ -117,6 +117,40 @@ impl Drop for SettingsHomeGuard {
     }
 }
 
+struct EnvVarGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl EnvVarGuard {
+    fn set(name: &'static str, value: &str) -> Self {
+        let lock = crate::test_support::lock_test_env();
+        let previous = std::env::var_os(name);
+        // Safety: test-only environment mutation guarded by a global mutex.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self {
+            name,
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // Safety: test-only environment mutation guarded by a global mutex.
+        unsafe {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(self.name, previous),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+}
+
 #[test]
 fn resume_hint_uses_canonical_resume_command() {
     assert_eq!(
@@ -3736,6 +3770,26 @@ fn teaching_sidebar_visibility_requires_student_event_and_wide_area() {
     assert!(!teaching_sidebar_visible(false, &state, 160));
     assert!(!teaching_sidebar_visible(true, &state, 119));
     assert!(teaching_sidebar_visible(true, &state, 120));
+}
+
+#[test]
+fn teaching_sidebar_is_hidden_for_embedded_desktop_tui() {
+    let _guard = EnvVarGuard::set("FUFAN_DESKTOP_TUI", "1");
+
+    let mut state = crate::education::state::EducationState::default();
+    state.push(crate::education::events::EducationEvent::new(
+        "evt_student",
+        "sess_1",
+        crate::education::events::EducationEventType::ContextUpdated,
+        "2026-06-17T15:00:00+08:00",
+        crate::education::events::EducationActor::System,
+        crate::education::events::EducationVisibility::Student,
+        crate::education::events::EducationSeverity::Info,
+        "student-visible event",
+        serde_json::json!({}),
+    ));
+
+    assert!(!teaching_sidebar_visible(true, &state, 160));
 }
 
 #[test]

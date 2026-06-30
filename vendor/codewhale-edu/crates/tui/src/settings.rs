@@ -284,11 +284,11 @@ pub struct Settings {
     pub provider_models: Option<std::collections::HashMap<String, String>>,
     /// Header status indicator next to the effort chip. Cycles through a
     /// per-turn animation keyed off `App::turn_started_at`:
-    /// - `"whale"` (default): historical `🐳 → 🐋` 12-frame sequence
+    /// - `"dots"` (default): the 6-frame geometric sequence (`◍ ◉ ◌ ◌ ◉ ◍`) that
+    ///   replaced the whale during the dots era.
+    /// - `"whale"`: historical `🐳 → 🐋` 12-frame sequence
     ///   originally shipped in v0.3.5, removed in v0.8.x's "smoother TUI
     ///   streaming" pass, restored in v0.8.30. Idle frame is a steady `🐳`.
-    /// - `"dots"`: the 6-frame geometric sequence (`◍ ◉ ◌ ◌ ◉ ◍`) that
-    ///   replaced the whale during the dots era.
     /// - `"off"`: hide the indicator entirely.
     pub status_indicator: String,
     /// Whether to wrap each draw in DEC mode 2026 synchronized output
@@ -359,7 +359,7 @@ impl Default for Settings {
             default_model: None,
             reasoning_effort: None,
             provider_models: None,
-            status_indicator: "whale".to_string(),
+            status_indicator: "dots".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
         }
@@ -1407,6 +1407,12 @@ mod tests {
     fn default_settings_show_footer_water_strip() {
         let settings = Settings::default();
         assert!(settings.fancy_animations);
+    }
+
+    #[test]
+    fn default_status_indicator_uses_neutral_dots() {
+        let settings = Settings::default();
+        assert_eq!(settings.status_indicator, "dots");
     }
 
     #[test]

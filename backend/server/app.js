@@ -14,6 +14,7 @@ import { loadCourseWiki } from "./wiki-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
+const CHAT_HISTORY_LIMIT = 8;
 
 export async function createApp(options = {}) {
   const knowledgeRoot = path.resolve(projectRoot, options.knowledgeRoot || "knowledge");
@@ -24,10 +25,15 @@ export async function createApp(options = {}) {
   const terminalManager = options.terminalManager || new TerminalManager({ projectRoot, env });
   const getRuntimeEnv = (overrides = {}) => settingsStore.buildModelEnv(env, overrides);
   const wikiOptions = { includeSeedPages: options.includeSeedPages };
-  let wiki = await loadCourseWiki(knowledgeRoot, wikiOptions);
+  const loadWiki = async () =>
+    loadCourseWiki(knowledgeRoot, {
+      ...wikiOptions,
+      catalog: await settingsStore.getKnowledgeCatalog(),
+    });
+  let wiki = await loadWiki();
 
   const reloadWiki = async () => {
-    wiki = await loadCourseWiki(knowledgeRoot, wikiOptions);
+    wiki = await loadWiki();
     return wiki;
   };
 
@@ -96,11 +102,23 @@ async function routeRequest(request, context) {
       testDeepSeekConnection({ env: runtimeEnv, fetchImpl: context.fetchImpl }),
       terminalStatus(context.terminalManager, runtimeEnv),
     ]);
+    let settings = await context.settingsStore.getModelSettings();
+    let resultEnv = runtimeEnv;
+    if (payload?.saveOnSuccess && llm.ok) {
+      settings = await context.settingsStore.saveModelSettings(overrides);
+      resultEnv = await context.getRuntimeEnv();
+      setTerminalEnv(context.terminalManager, resultEnv);
+    }
     const lastTest = await context.settingsStore.saveModelTestResult({
       llm,
-      settings: modelSettingsFromRuntimeEnv(runtimeEnv),
+      settings: modelSettingsFromRuntimeEnv(resultEnv),
     });
-    return jsonResponse({ llm, terminal, lastTest });
+    return jsonResponse({
+      settings: context.settingsStore.publicModelSettings(settings),
+      llm,
+      terminal: payload?.saveOnSuccess && llm.ok ? await terminalStatus(context.terminalManager, resultEnv) : terminal,
+      lastTest,
+    });
   }
 
   if (pathname === "/api/import/status") {
@@ -174,6 +192,16 @@ async function routeRequest(request, context) {
       return jsonResponse({ ok: true });
     }
 
+    if (action === "resize" && request.method === "POST") {
+      const payload = await readJson(request);
+      const ok = await context.terminalManager.resizeSession(sessionId, {
+        cols: payload.cols,
+        rows: payload.rows,
+      });
+      if (!ok) return jsonResponse({ error: { code: "TERMINAL_SESSION_NOT_FOUND", message: "未找到智能体会话" } }, 404);
+      return jsonResponse({ ok: true });
+    }
+
     if (!action && request.method === "DELETE") {
       const ok = context.terminalManager.stopSession(sessionId);
       if (!ok) return jsonResponse({ error: { code: "TERMINAL_SESSION_NOT_FOUND", message: "未找到智能体会话" } }, 404);
@@ -204,6 +232,60 @@ async function routeRequest(request, context) {
     return jsonResponse({ ...result, wikiPages: nextWiki.pages.length, manifest: nextWiki.manifest });
   }
 
+  const knowledgePageMatch = pathname.match(/^\/api\/knowledge\/pages\/([^/]+)$/);
+  if (knowledgePageMatch) {
+    const id = decodeURIComponent(knowledgePageMatch[1]);
+    const page = wiki.getPage(id);
+    if (!page) return jsonResponse({ error: { code: "PAGE_NOT_FOUND", message: `未找到课件：${id}` } }, 404);
+
+    if (request.method === "PATCH") {
+      const payload = await readJson(request);
+      const update = knowledgePageUpdatePayload(payload, wiki.manifest);
+      if (update.error) return jsonResponse({ error: update.error }, 400);
+      await context.settingsStore.updateKnowledgePage(id, update.value);
+      const nextWiki = await context.reloadWiki();
+      const nextPage = nextWiki.getPage(id);
+      return jsonResponse({ page: summarizePage(nextPage), manifest: nextWiki.manifest });
+    }
+
+    if (request.method === "DELETE") {
+      await context.settingsStore.softDeleteKnowledgePage(id);
+      const nextWiki = await context.reloadWiki();
+      return jsonResponse({ ok: true, manifest: nextWiki.manifest });
+    }
+  }
+
+  const knowledgeModuleMatch = pathname.match(/^\/api\/knowledge\/modules\/([^/]+)$/);
+  if (knowledgeModuleMatch) {
+    const id = decodeURIComponent(knowledgeModuleMatch[1]);
+    const module = findManifestModule(wiki.manifest, id);
+    if (!module) return jsonResponse({ error: { code: "MODULE_NOT_FOUND", message: `未找到知识库目录：${id}` } }, 404);
+
+    if (request.method === "PATCH") {
+      const payload = await readJson(request);
+      const update = knowledgeModuleUpdatePayload(payload);
+      if (update.error) return jsonResponse({ error: update.error }, 400);
+      await context.settingsStore.updateKnowledgeModule(id, update.value);
+      const nextWiki = await context.reloadWiki();
+      return jsonResponse({ module: findManifestModule(nextWiki.manifest, id), manifest: nextWiki.manifest });
+    }
+
+    if (request.method === "DELETE") {
+      await context.settingsStore.softDeleteKnowledgeModule(id);
+      const nextWiki = await context.reloadWiki();
+      return jsonResponse({ ok: true, manifest: nextWiki.manifest });
+    }
+  }
+
+  if (pathname === "/api/knowledge/reorder" && request.method === "POST") {
+    const payload = await readJson(request);
+    const reorder = normalizeKnowledgeReorder(payload, wiki);
+    if (reorder.error) return jsonResponse({ error: reorder.error }, 400);
+    await context.settingsStore.reorderKnowledge(reorder.value);
+    const nextWiki = await context.reloadWiki();
+    return jsonResponse({ ok: true, manifest: nextWiki.manifest });
+  }
+
   if (pathname === "/api/manifest") {
     return jsonResponse(wiki.manifest);
   }
@@ -225,21 +307,50 @@ async function routeRequest(request, context) {
     return jsonResponse({ results: searchPages(wiki.pages, query, { moduleId }) });
   }
 
+  if (pathname === "/api/chat/history" && request.method === "GET") {
+    const pageId = String(url.searchParams.get("pageId") || "").trim();
+    if (!pageId) return jsonResponse({ error: { code: "PAGE_ID_REQUIRED", message: "pageId is required" } }, 400);
+    if (!wiki.getPage(pageId)) {
+      return jsonResponse({ error: { code: "PAGE_NOT_FOUND", message: `未找到课件：${pageId}` } }, 404);
+    }
+    const limit = Number(url.searchParams.get("limit") || 50);
+    return jsonResponse({ messages: await context.settingsStore.getChatMessages(pageId, limit) });
+  }
+
   if (pathname === "/api/chat" && request.method === "POST") {
     const payload = await readJson(request);
     const message = String(payload.message || "");
     if (!message.trim()) {
       return jsonResponse({ error: { code: "EMPTY_MESSAGE", message: "Message is required" } }, 400);
     }
-    return jsonResponse(
-      await answerFromCourseWiki({
-        message,
-        pages: wiki.pages,
-        moduleId: payload.moduleId,
-        env: await context.getRuntimeEnv(),
-        fetchImpl: context.fetchImpl,
-      }),
-    );
+    const pageId = String(payload.pageId || "").trim();
+    const page = pageId ? wiki.getPage(pageId) : null;
+    if (pageId && !page) {
+      return jsonResponse({ error: { code: "PAGE_NOT_FOUND", message: `未找到课件：${pageId}` } }, 404);
+    }
+    const persistedHistory = pageId ? await context.settingsStore.getChatMessages(pageId, CHAT_HISTORY_LIMIT) : [];
+    const result = await answerFromCourseWiki({
+      message,
+      pages: wiki.pages,
+      moduleId: payload.moduleId,
+      pageId,
+      contextMode: String(payload.contextMode || ""),
+      conversationHistory: persistedHistory.length ? persistedHistory : payload.conversationHistory,
+      env: await context.getRuntimeEnv(),
+      fetchImpl: context.fetchImpl,
+    });
+    const answerHtml = renderMarkdownToHtml(result.answer);
+    if (pageId) {
+      await context.settingsStore.appendChatMessage(pageId, { role: "user", content: message, title: page.title });
+      await context.settingsStore.appendChatMessage(pageId, {
+        role: "assistant",
+        content: result.answer,
+        answerHtml,
+        sources: result.sources,
+        title: page.title,
+      });
+    }
+    return jsonResponse({ ...result, answerHtml });
   }
 
   if (pathname.startsWith("/api/")) {
@@ -299,6 +410,97 @@ function compactModelPayload(payload = {}) {
   return next;
 }
 
+function knowledgePageUpdatePayload(payload = {}, manifest) {
+  const value = {};
+
+  if (Object.prototype.hasOwnProperty.call(payload, "title")) {
+    const title = String(payload.title || "").trim();
+    if (!title) return { error: { code: "INVALID_TITLE", message: "课件名称不能为空" } };
+    value.title = title;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "moduleId")) {
+    const moduleId = String(payload.moduleId || "").trim();
+    if (!moduleId) return { error: { code: "INVALID_MODULE", message: "目标目录不能为空" } };
+    if (!findManifestModule(manifest, moduleId)) {
+      return { error: { code: "MODULE_NOT_FOUND", message: `未找到知识库目录：${moduleId}` } };
+    }
+    value.moduleId = moduleId;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "sortOrder")) {
+    value.sortOrder = normalizeKnowledgeSortOrder(payload.sortOrder, null);
+  }
+
+  return { value };
+}
+
+function knowledgeModuleUpdatePayload(payload = {}) {
+  const value = {};
+
+  if (Object.prototype.hasOwnProperty.call(payload, "title")) {
+    const title = String(payload.title || "").trim();
+    if (!title) return { error: { code: "INVALID_TITLE", message: "目录名称不能为空" } };
+    value.title = title;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(payload, "sortOrder")) {
+    value.sortOrder = normalizeKnowledgeSortOrder(payload.sortOrder, null);
+  }
+
+  return { value };
+}
+
+function normalizeKnowledgeReorder(payload = {}, wiki) {
+  if (!Array.isArray(payload.modules) && !Array.isArray(payload.pages)) {
+    return { error: { code: "INVALID_REORDER", message: "排序数据不能为空" } };
+  }
+
+  const moduleIds = new Set(wiki.manifest.modules.map((module) => module.id));
+  const modules = (payload.modules || []).map((module, index) => {
+    const id = String(module?.id || "").trim();
+    return {
+      id,
+      sortOrder: normalizeKnowledgeSortOrder(module?.sortOrder, index),
+    };
+  });
+  for (const module of modules) {
+    if (!module.id || !moduleIds.has(module.id)) {
+      return { error: { code: "MODULE_NOT_FOUND", message: `未找到知识库目录：${module.id || "空"}` } };
+    }
+  }
+
+  const pageIds = new Set(wiki.pages.map((page) => page.id));
+  const pages = (payload.pages || []).map((page, index) => {
+    const id = String(page?.id || "").trim();
+    const currentPage = id ? wiki.getPage(id) : null;
+    return {
+      id,
+      moduleId: String(page?.moduleId || currentPage?.module || "").trim(),
+      sortOrder: normalizeKnowledgeSortOrder(page?.sortOrder, index),
+    };
+  });
+  for (const page of pages) {
+    if (!page.id || !pageIds.has(page.id)) {
+      return { error: { code: "PAGE_NOT_FOUND", message: `未找到课件：${page.id || "空"}` } };
+    }
+    if (!page.moduleId || !moduleIds.has(page.moduleId)) {
+      return { error: { code: "MODULE_NOT_FOUND", message: `未找到知识库目录：${page.moduleId || "空"}` } };
+    }
+  }
+
+  return { value: { modules, pages } };
+}
+
+function normalizeKnowledgeSortOrder(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.trunc(number) : fallback;
+}
+
+function findManifestModule(manifest, id) {
+  return (manifest.modules || []).find((module) => module.id === id) || null;
+}
+
 async function readJson(request) {
   try {
     return await request.json();
@@ -343,6 +545,8 @@ function contentType(filePath) {
   if (extension === ".html") return "text/html; charset=utf-8";
   if (extension === ".css") return "text/css; charset=utf-8";
   if (extension === ".js") return "text/javascript; charset=utf-8";
+  if (extension === ".mjs") return "text/javascript; charset=utf-8";
   if (extension === ".json") return "application/json; charset=utf-8";
+  if (extension === ".map") return "application/json; charset=utf-8";
   return "application/octet-stream";
 }

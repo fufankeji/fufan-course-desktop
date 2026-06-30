@@ -1,9 +1,33 @@
-import { searchPages } from "./search.js";
+import { searchPages, summarizePage } from "./search.js";
 import { answerWithDeepSeek, sanitizeModelError } from "./llm.js";
 
-export async function answerFromCourseWiki({ message, pages, moduleId, env = process.env, fetchImpl = fetch }) {
-  const sources = searchPages(pages, message, { moduleId, limit: 5 });
+export async function answerFromCourseWiki({
+  message,
+  pages,
+  moduleId,
+  pageId,
+  contextMode,
+  conversationHistory,
+  env = process.env,
+  fetchImpl = fetch,
+}) {
+  const history = normalizeConversationHistory(conversationHistory);
   const trimmed = message.trim();
+  const previousQuestion = lastUserMessage(history);
+  if (isPreviousQuestionRequest(trimmed) && previousQuestion) {
+    return {
+      answer: `你刚才的问题是：${previousQuestion}`,
+      sources: [],
+      mode: "local-simulated",
+    };
+  }
+
+  const currentPage = findPage(pages, pageId);
+  const currentPageOnly = contextMode === "current-page" && currentPage;
+  const sources = currentPageOnly
+    ? [sourceFromPage(currentPage)]
+    : prioritizeCurrentPage(searchPages(pages, message, { moduleId, limit: 5 }), pages, pageId);
+  const responseSources = currentPageOnly ? [] : sources;
 
   if (!sources.length) {
     return {
@@ -18,17 +42,25 @@ export async function answerFromCourseWiki({ message, pages, moduleId, env = pro
 
   const sourcePages = sources.map((source) => pages.find((page) => page.id === source.id)).filter(Boolean);
   try {
-    const llmAnswer = await answerWithDeepSeek({ message: trimmed, sourcePages, env, fetchImpl });
+    const llmAnswer = await answerWithDeepSeek({
+      message: trimmed,
+      sourcePages,
+      currentPageId: pageId,
+      contextMode,
+      conversationHistory: history,
+      env,
+      fetchImpl,
+    });
     if (llmAnswer) {
       return {
         answer: llmAnswer.answer,
-        sources,
+        sources: responseSources,
         mode: llmAnswer.mode,
         model: llmAnswer.model,
       };
     }
   } catch (error) {
-    const local = buildLocalAnswer(trimmed, sources);
+    const local = currentPageOnly ? buildCurrentPageLocalAnswer(trimmed, currentPage) : buildLocalAnswer(trimmed, sources);
     return {
       ...local,
       mode: "local-simulated",
@@ -37,9 +69,59 @@ export async function answerFromCourseWiki({ message, pages, moduleId, env = pro
   }
 
   return {
-    ...buildLocalAnswer(trimmed, sources),
+    ...(currentPageOnly ? buildCurrentPageLocalAnswer(trimmed, currentPage) : buildLocalAnswer(trimmed, sources)),
     mode: "local-simulated",
   };
+}
+
+function prioritizeCurrentPage(sources, pages, pageId) {
+  const currentPageId = String(pageId || "").trim();
+  if (!currentPageId) return sources;
+
+  const currentPage = findPage(pages, currentPageId);
+  if (!currentPage) return sources;
+
+  const existing = sources.find((source) => source.id === currentPageId);
+  const currentSource = existing || sourceFromPage(currentPage);
+
+  return [currentSource, ...sources.filter((source) => source.id !== currentPageId)].slice(0, 5);
+}
+
+function findPage(pages, pageId) {
+  const currentPageId = String(pageId || "").trim();
+  if (!currentPageId) return null;
+  return pages.find((page) => page.id === currentPageId) || null;
+}
+
+function sourceFromPage(page) {
+  return {
+    ...summarizePage(page),
+    score: Number.MAX_SAFE_INTEGER,
+    snippet: page.summary || capText(page.plainText, 180),
+  };
+}
+
+function normalizeConversationHistory(history) {
+  if (!Array.isArray(history)) return [];
+
+  return history
+    .map((item) => ({
+      role: item?.role === "assistant" ? "assistant" : item?.role === "user" ? "user" : "",
+      content: capText(item?.content, 600),
+    }))
+    .filter((item) => item.role && item.content)
+    .slice(-8);
+}
+
+function lastUserMessage(history) {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    if (history[index].role === "user") return history[index].content;
+  }
+  return "";
+}
+
+function isPreviousQuestionRequest(message) {
+  return /刚才.*(问|问题)|上一(个|次|条).*(问|问题)|之前.*(问|问题)/.test(message);
 }
 
 function sanitizeLlmError(message) {
@@ -68,6 +150,25 @@ function buildLocalAnswer(trimmed, sources) {
   ].join("\n\n");
 
   return { answer, sources };
+}
+
+function buildCurrentPageLocalAnswer(question, page) {
+  const answer = buildDirectCurrentPageAnswer(question, page);
+
+  return { answer, sources: [] };
+}
+
+function buildDirectCurrentPageAnswer(question, page) {
+  return [
+    "我会直接结合当前课件回答你的问题，但当前模型没有返回可用内容，所以这里只给出通用判断框架。",
+    `结合《${page.title}》，你可以重点看它对应的是平台选择、成本权衡、环境稳定性，还是后续实操步骤。`,
+    "如果你要判断某个方案是否可行，重点看三件事：它是否稳定可复现、成本是否可控、是否会影响你完成本节课实验。不要把时间消耗在和课程目标关系不大的平台限制或账号问题上。",
+  ].join("\n\n");
+}
+
+function capText(value, limit) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit).trim()}...` : text;
 }
 
 function buildPathLine(question, sources) {

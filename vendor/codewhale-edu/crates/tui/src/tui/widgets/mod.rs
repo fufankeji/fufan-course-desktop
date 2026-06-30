@@ -734,9 +734,9 @@ impl Renderable for ComposerWidget<'_> {
                         self.app
                             .tr(crate::localization::MessageId::HistorySearchTitle)
                     } else if is_draft_mode {
-                        "Draft"
+                        "草稿"
                     } else {
-                        "Composer"
+                        "输入区"
                     },
                     Style::default().fg(palette::TEXT_MUTED),
                 )))
@@ -2136,28 +2136,118 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     }
 
     let workspace = crate::utils::display_path(&app.workspace);
-    let body_width = usize::from(area.width.saturating_sub(8).clamp(24, 72));
+    let course_title = std::env::var("FUFAN_COURSE_TITLE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "当前课件已绑定".to_string());
+    let skill_name = std::env::var("FUFAN_SKILL_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Context Compression".to_string());
+    let body_width = usize::from(area.width.saturating_sub(4).clamp(42, 96));
     let left_padding = usize::from(area.width.saturating_sub(body_width as u16) / 2);
     let inset = " ".repeat(left_padding);
+    let info_width = body_width.saturating_sub(4).max(8);
+    let left_col_width = info_width.saturating_mul(58) / 100;
+    let right_col_width = info_width.saturating_sub(left_col_width + 3);
+    let split_layout = body_width >= 78 && right_col_width >= 20;
 
-    let body = vec![
-        Line::from(Span::styled(
-            format!(
-                "{inset}>_ FuFan Teaching Agent TUI (v{})",
-                env!("CARGO_PKG_VERSION")
-            ),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{inset}model: {}  /model to switch", app.model),
+    let mut body = vec![
+        dashboard_title_line(&inset, body_width, "赋范智能体 v0.0.1"),
+        dashboard_line(
+            &inset,
+            body_width,
+            "欢迎来到赋范空间课程智能体",
+            Style::default().fg(palette::TEXT_PRIMARY).bold(),
+        ),
+        dashboard_line(
+            &inset,
+            body_width,
+            "每次打开控制台都会从这里开始；下方输入框可直接提问，也可以输入 / 使用命令。",
             Style::default().fg(palette::TEXT_MUTED),
-        )),
-        Line::from(Span::styled(
-            format!("{inset}directory: {workspace}"),
-            Style::default().fg(palette::TEXT_MUTED),
-        )),
+        ),
+        dashboard_separator_line(&inset, body_width),
     ];
+
+    if split_layout {
+        body.extend([
+            dashboard_two_column_line(
+                &inset,
+                body_width,
+                left_col_width,
+                right_col_width,
+                &format!("当前课件  {course_title}"),
+                "/help  查看命令",
+            ),
+            dashboard_two_column_line(
+                &inset,
+                body_width,
+                left_col_width,
+                right_col_width,
+                &format!("能力包    {skill_name}"),
+                "/model 切换模型",
+            ),
+            dashboard_two_column_line(
+                &inset,
+                body_width,
+                left_col_width,
+                right_col_width,
+                &format!("当前模型  {}", app.model),
+                "/init  初始化上下文",
+            ),
+            dashboard_two_column_line(
+                &inset,
+                body_width,
+                left_col_width,
+                right_col_width,
+                &format!("课程工作区  {workspace}"),
+                "围绕当前课件直接提问",
+            ),
+        ]);
+    } else {
+        body.extend([
+            dashboard_line(
+                &inset,
+                body_width,
+                &format!("当前课件  {course_title}"),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            ),
+            dashboard_line(
+                &inset,
+                body_width,
+                &format!("能力包    {skill_name}"),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            ),
+            dashboard_line(
+                &inset,
+                body_width,
+                &format!("当前模型  {}", app.model),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            ),
+            dashboard_line(
+                &inset,
+                body_width,
+                &format!("课程工作区  {workspace}"),
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+            dashboard_separator_line(&inset, body_width),
+            dashboard_line(
+                &inset,
+                body_width,
+                "/help  查看命令   /model 切换模型",
+                Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+            ),
+            dashboard_line(
+                &inset,
+                body_width,
+                "围绕当前课件直接提问",
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+        ]);
+    }
+    body.push(dashboard_bottom_line(&inset, body_width));
 
     // Keep the welcome block near the top of the chat pane (header is separate).
     let top_padding = 2usize;
@@ -2167,6 +2257,86 @@ fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     }
     lines.extend(body);
     lines
+}
+
+fn dashboard_title_line(inset: &str, width: usize, title: &str) -> Line<'static> {
+    let prefix = "╭─ ";
+    let suffix = " ╮";
+    let title = truncate_display_width(title, width.saturating_sub(6));
+    let filler = width
+        .saturating_sub(text_display_width(prefix) + text_display_width(&title) + text_display_width(suffix));
+    Line::from(vec![
+        Span::raw(inset.to_string()),
+        Span::styled(
+            format!("{prefix}{title}{}{}", "─".repeat(filler), suffix),
+            Style::default()
+                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn dashboard_bottom_line(inset: &str, width: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(inset.to_string()),
+        Span::styled(
+            format!("╰{}╯", "─".repeat(width.saturating_sub(2))),
+            Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+        ),
+    ])
+}
+
+fn dashboard_separator_line(inset: &str, width: usize) -> Line<'static> {
+    dashboard_line(
+        inset,
+        width,
+        &"─".repeat(width.saturating_sub(4)),
+        Style::default().fg(palette::TEXT_MUTED),
+    )
+}
+
+fn dashboard_line(inset: &str, width: usize, content: &str, style: Style) -> Line<'static> {
+    let inner_width = width.saturating_sub(4).max(1);
+    let content = truncate_display_width(content, inner_width);
+    let padding = inner_width.saturating_sub(text_display_width(&content));
+    Line::from(vec![
+        Span::raw(inset.to_string()),
+        Span::styled("│ ".to_string(), Style::default().fg(palette::WHALE_ACCENT_PRIMARY)),
+        Span::styled(content, style),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(" │".to_string(), Style::default().fg(palette::WHALE_ACCENT_PRIMARY)),
+    ])
+}
+
+fn dashboard_two_column_line(
+    inset: &str,
+    width: usize,
+    left_width: usize,
+    right_width: usize,
+    left: &str,
+    right: &str,
+) -> Line<'static> {
+    let left = truncate_display_width(left, left_width);
+    let right = truncate_display_width(right, right_width);
+    let left_padding = left_width.saturating_sub(text_display_width(&left));
+    let right_padding = right_width.saturating_sub(text_display_width(&right));
+    let used = left_width + right_width + 3;
+    let tail_padding = width.saturating_sub(4 + used);
+    Line::from(vec![
+        Span::raw(inset.to_string()),
+        Span::styled("│ ".to_string(), Style::default().fg(palette::WHALE_ACCENT_PRIMARY)),
+        Span::styled(left, Style::default().fg(palette::TEXT_PRIMARY)),
+        Span::raw(" ".repeat(left_padding)),
+        Span::styled(" │ ".to_string(), Style::default().fg(palette::TEXT_MUTED)),
+        Span::styled(
+            right,
+            Style::default()
+                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(right_padding + tail_padding)),
+        Span::styled(" │".to_string(), Style::default().fg(palette::WHALE_ACCENT_PRIMARY)),
+    ])
 }
 
 pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usize {
@@ -2858,6 +3028,10 @@ mod tests {
             text.push('\n');
         }
         text
+    }
+
+    fn compact_buffer_text(text: &str) -> String {
+        text.chars().filter(|ch| !ch.is_whitespace()).collect()
     }
 
     fn success_tool_cell(name: &str) -> HistoryCell {
@@ -3567,6 +3741,7 @@ mod tests {
     fn composer_border_renders_session_title() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
+        app.ui_locale = Locale::ZhHans;
         app.session_title = Some("my-session".to_string());
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
         let mention_menu_entries = Vec::<String>::new();
@@ -3581,8 +3756,10 @@ mod tests {
 
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
+        let compact = compact_buffer_text(&rendered);
 
-        assert!(rendered.contains("Composer"));
+        assert!(compact.contains("输入区"), "{rendered}");
+        assert!(compact.contains("编写任务或使用/。"), "{rendered}");
         assert!(rendered.contains("my-session"));
     }
 
@@ -3590,6 +3767,7 @@ mod tests {
     fn composer_border_renders_active_turn_receipt() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
+        app.ui_locale = Locale::ZhHans;
         app.set_receipt_text("✓ turn completed · 2 tool(s) used");
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
         let mention_menu_entries = Vec::<String>::new();
@@ -3604,8 +3782,10 @@ mod tests {
 
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
+        let compact = compact_buffer_text(&rendered);
 
-        assert!(rendered.contains("Composer"));
+        assert!(compact.contains("输入区"), "{rendered}");
+        assert!(compact.contains("编写任务或使用/。"), "{rendered}");
         assert!(rendered.contains("turn completed"));
         assert!(rendered.contains("tool(s) used"));
     }
@@ -3747,12 +3927,13 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains(&format!(
-            ">_ FuFan Teaching Agent TUI (v{})",
-            env!("CARGO_PKG_VERSION")
-        )));
-        assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
-        assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
+        assert!(rendered.contains("赋范智能体 v0.0.1"));
+        assert!(rendered.contains("欢迎来到赋范空间课程智能体"));
+        assert!(rendered.contains("当前模型  deepseek-v4-pro"));
+        assert!(rendered.contains("课程工作区  /tmp/codewhale-test-workspace"));
+        assert!(rendered.contains("/help  查看命令"));
+        assert!(rendered.contains("/model 切换模型"));
+        assert!(rendered.contains("围绕当前课件直接提问"));
     }
 
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total

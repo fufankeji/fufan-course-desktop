@@ -44,9 +44,8 @@ const STATUS_INDICATOR_DOT_FRAMES: &[&str] = &["◍", "◉", "◌", "◌", "◉"
 /// chip is *visible* but not animating — it's a chip, not a spinner. As
 /// soon as a turn starts, the elapsed time keys the cycle.
 ///
-/// `mode` accepts the canonical names `"whale"`, `"dots"`, `"off"` (any
-/// other value is treated as `"whale"` to mirror
-/// `StatusIndicatorValue::from(&str)`). `"off"` returns `None` so the
+/// `mode` accepts the canonical names `"dots"`, `"whale"`, `"off"` (any
+/// other value is treated as `"dots"`). `"off"` returns `None` so the
 /// caller can hide the chip outright.
 #[must_use]
 pub fn header_status_indicator_frame(
@@ -55,9 +54,9 @@ pub fn header_status_indicator_frame(
 ) -> Option<&'static str> {
     let frames: &[&str] = match mode.trim().to_ascii_lowercase().as_str() {
         "off" | "none" | "hidden" | "false" => return None,
-        "dots" | "dot" => STATUS_INDICATOR_DOT_FRAMES,
-        // "whale" + aliases + unknown → whale (intentional default).
-        _ => STATUS_INDICATOR_WHALE_FRAMES,
+        "whale" => STATUS_INDICATOR_WHALE_FRAMES,
+        // "dots" + aliases + unknown → dots (neutral default).
+        _ => STATUS_INDICATOR_DOT_FRAMES,
     };
     let elapsed_ms = turn_started_at
         .map(|t| t.elapsed().as_millis())
@@ -846,11 +845,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_indicator_mode_defaults_to_whale() {
-        // We'd rather restore the whale on a typo than silently hide the
-        // chip — matches `StatusIndicatorValue::from(&str)`.
+    fn unknown_indicator_mode_defaults_to_dots() {
+        // Unknown values stay visible but fall back to the neutral default.
         let frame = super::header_status_indicator_frame(None, "wahel-typo");
-        assert_eq!(frame, Some("🐳"));
+        assert_eq!(frame, Some("\u{25CD}"));
     }
 
     #[test]

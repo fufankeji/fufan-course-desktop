@@ -280,7 +280,7 @@ impl RepoConstitution {
             }
         }
         format!(
-            "<codewhale_repo_constitution source=\"{}\">\nCodeWhale-specific repo authority policy (local law: subordinate to the global Constitution and the current user request, but above memory and old handoffs; takes precedence over a legacy WHALE.md).\n\n{}</codewhale_repo_constitution>",
+            "<codewhale_repo_constitution source=\"{}\">\nFuFan Teaching Agent repo authority policy (local law: subordinate to the global Constitution and the current user request, but above memory and old handoffs; takes precedence over a legacy WHALE.md).\n\n{}</codewhale_repo_constitution>",
             source.display(),
             body.trim_end()
         )
@@ -933,7 +933,7 @@ fn generate_ephemeral_context(workspace: &Path) -> Option<String> {
 
     Some(format!(
         "# Project Context (Auto-generated, ephemeral)\n\n\
-         > This context was generated in memory by CodeWhale.\n\
+         > This context was generated in memory by FuFan Teaching Agent.\n\
          > No .codewhale/instructions.md file was written.\n\n\
          {overview}"
     ))
@@ -998,7 +998,7 @@ pub fn create_default_agents_md(workspace: &Path) -> std::io::Result<PathBuf> {
 
     let default_content = r#"# Project Agent Instructions
 
-This file provides guidance to AI agents (CodeWhale, Claude Code, etc.) when working with code in this repository.
+This file provides guidance to AI agents (FuFan Teaching Agent, Claude Code, etc.) when working with code in this repository.
 
 ## File Location
 
